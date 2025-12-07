@@ -7,11 +7,11 @@ export async function ensureDir(dir: string) {
   await fs.promises.mkdir(dir, { recursive: true });
 }
 
-export type Provider = "web";
+export type Provider = "web" | "telegram";
 
 export function assertProvider(input: string): asserts input is Provider {
-  if (input !== "web") {
-    throw new Error("Provider must be 'web'");
+  if (input !== "web" && input !== "telegram") {
+    throw new Error("Provider must be 'web' or 'telegram'");
   }
 }
 

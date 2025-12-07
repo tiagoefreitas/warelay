@@ -17,13 +17,18 @@ import {
   setHeartbeatsEnabled,
   type WebMonitorTuning,
 } from "../provider-web.js";
-import { defaultRuntime } from "../runtime.js";
+import {
+  deleteTelegramToken,
+  saveTelegramToken,
+} from "../providers/telegram/index.js";
+import { defaultRuntime, type RuntimeEnv } from "../runtime.js";
+import { assertProvider } from "../utils.js";
 import { VERSION } from "../version.js";
 import {
   resolveHeartbeatSeconds,
   resolveReconnectPolicy,
 } from "../web/reconnect.js";
-import { createDefaultDeps, logWebSelfId } from "./deps.js";
+import { createDefaultDeps, logWebSelfId, monitorTelegram } from "./deps.js";
 import { spawnRelayTmux } from "./relay_tmux.js";
 
 export function buildProgram() {
@@ -105,27 +110,82 @@ export function buildProgram() {
 
   program
     .command("login")
-    .description("Link your personal WhatsApp via QR (web provider)")
+    .description(
+      "Link your personal WhatsApp via QR (web) or Telegram bot token",
+    )
     .option("--verbose", "Verbose connection logs", false)
-    .option("--provider <provider>", "Provider alias (default: whatsapp)")
+    .option("--provider <provider>", "Provider: web | telegram (default: web)")
     .action(async (opts) => {
       setVerbose(Boolean(opts.verbose));
+      const providerInput = opts.provider ?? "web";
       try {
-        const provider = opts.provider ?? "whatsapp";
+        if (providerInput === "telegram") {
+          // Telegram login: prompt for bot token
+          const { createInterface } = await import("node:readline");
+          const rl = createInterface({
+            input: process.stdin,
+            output: process.stdout,
+          });
+          const askQuestion = (q: string): Promise<string> =>
+            new Promise((resolve) => rl.question(q, resolve));
+
+          defaultRuntime.log(
+            info(
+              "Login to Telegram by providing your bot token from @BotFather.",
+            ),
+          );
+          const token = await askQuestion("Bot token: ");
+          rl.close();
+
+          if (!token.trim()) {
+            defaultRuntime.error(danger("Bot token is required."));
+            defaultRuntime.exit(1);
+            return;
+          }
+
+          // Validate token by creating a bot and calling getMe
+          const { createTelegramBot, closeTelegramBot } = await import(
+            "../providers/telegram/index.js"
+          );
+          const bot = createTelegramBot(token.trim());
+          try {
+            const me = await bot.api.getMe();
+            defaultRuntime.log(
+              info(`Logged in as @${me.username} (${me.first_name})`),
+            );
+            await saveTelegramToken(token.trim());
+            defaultRuntime.log(info("Telegram token saved."));
+          } catch (err) {
+            defaultRuntime.error(danger(`Invalid bot token: ${String(err)}`));
+            defaultRuntime.exit(1);
+          } finally {
+            closeTelegramBot();
+          }
+          return;
+        }
+
+        // Web provider (default)
+        const provider =
+          providerInput === "whatsapp" ? "whatsapp" : providerInput;
         await loginWeb(Boolean(opts.verbose), provider);
       } catch (err) {
-        defaultRuntime.error(danger(`Web login failed: ${String(err)}`));
+        defaultRuntime.error(danger(`Login failed: ${String(err)}`));
         defaultRuntime.exit(1);
       }
     });
 
   program
     .command("logout")
-    .description("Clear cached WhatsApp Web credentials")
-    .option("--provider <provider>", "Provider alias (default: whatsapp)")
+    .description("Clear cached credentials (web or telegram)")
+    .option("--provider <provider>", "Provider: web | telegram (default: web)")
     .action(async (opts) => {
       try {
-        void opts.provider; // placeholder for future multi-provider; currently web only.
+        const providerInput = opts.provider ?? "web";
+        if (providerInput === "telegram") {
+          await deleteTelegramToken();
+          defaultRuntime.log(info("Telegram token deleted."));
+          return;
+        }
         await logoutWeb(defaultRuntime);
       } catch (err) {
         defaultRuntime.error(danger(`Logout failed: ${String(err)}`));
@@ -135,16 +195,17 @@ export function buildProgram() {
 
   program
     .command("send")
-    .description("Send a WhatsApp message (web provider)")
+    .description("Send a message (web or telegram)")
     .requiredOption(
       "-t, --to <number>",
-      "Recipient number in E.164 (e.g. +15555550123)",
+      "Recipient: E.164 for web (e.g. +15555550123), chat ID for telegram",
     )
     .requiredOption("-m, --message <text>", "Message body")
     .option(
       "--media <path-or-url>",
       "Attach media (image/audio/video/document). Accepts local paths or URLs.",
     )
+    .option("--provider <provider>", "Provider: web | telegram (default: web)")
     .option("--dry-run", "Print payload and skip sending", false)
     .option("--json", "Output result as JSON", false)
     .option("--verbose", "Verbose logging", false)
@@ -155,13 +216,20 @@ Examples:
   clawdis send --to +15555550123 --message "Hi"
   clawdis send --to +15555550123 --message "Hi" --media photo.jpg
   clawdis send --to +15555550123 --message "Hi" --dry-run      # print payload only
-  clawdis send --to +15555550123 --message "Hi" --json         # machine-readable result`,
+  clawdis send --to +15555550123 --message "Hi" --json         # machine-readable result
+  clawdis send --to 123456789 --message "Hi" --provider telegram`,
     )
     .action(async (opts) => {
       setVerbose(Boolean(opts.verbose));
       const deps = createDefaultDeps();
+      const providerInput = opts.provider ?? "web";
       try {
-        await sendCommand(opts, deps, defaultRuntime);
+        assertProvider(providerInput);
+        await sendCommand(
+          { ...opts, provider: providerInput },
+          deps,
+          defaultRuntime,
+        );
       } catch (err) {
         defaultRuntime.error(String(err));
         defaultRuntime.exit(1);
@@ -252,10 +320,18 @@ Examples:
           }
 
           const logs: string[] = [];
-          const runtime = {
-            log: (msg: string) => logs.push(String(msg)),
-            error: (msg: string) => logs.push(String(msg)),
-            exit: (_code: number) => {},
+          const runtime: RuntimeEnv = {
+            log: (msg: string) => {
+              logs.push(String(msg));
+              return undefined as unknown as ReturnType<typeof console.log>;
+            },
+            error: (msg: string) => {
+              logs.push(String(msg));
+              return undefined as unknown as ReturnType<typeof console.error>;
+            },
+            exit: (_code: number): never => {
+              throw new Error("exit called in RPC context");
+            },
           };
 
           const opts: {
@@ -389,7 +465,8 @@ Examples:
 
   program
     .command("relay")
-    .description("Auto-reply to inbound messages (web only)")
+    .description("Auto-reply to inbound messages (web or telegram)")
+    .option("--provider <provider>", "Provider: web | telegram (default: web)")
     .option(
       "--web-heartbeat <seconds>",
       "Heartbeat interval for web relay health logs (seconds)",
@@ -415,11 +492,31 @@ Examples:
 Examples:
   clawdis relay                     # uses your linked web session
   clawdis relay --web-heartbeat 60  # override heartbeat interval
+  clawdis relay --provider telegram # use Telegram bot relay
   # Troubleshooting: docs/refactor/web-relay-troubleshooting.md
 `,
     )
     .action(async (opts) => {
       setVerbose(Boolean(opts.verbose));
+      const providerInput = opts.provider ?? "web";
+
+      // Telegram provider
+      if (providerInput === "telegram") {
+        defaultRuntime.log(info("Starting Telegram relay..."));
+        try {
+          await monitorTelegram({
+            runtime: defaultRuntime,
+            verbose: Boolean(opts.verbose),
+          });
+          return;
+        } catch (err) {
+          defaultRuntime.error(danger(`Telegram relay failed: ${String(err)}`));
+          defaultRuntime.exit(1);
+        }
+        return;
+      }
+
+      // Web provider (default)
       const { file: logFile, level: logLevel } = getResolvedLoggerSettings();
       defaultRuntime.log(info(`logs: ${logFile} (level ${logLevel})`));
       const webHeartbeat =

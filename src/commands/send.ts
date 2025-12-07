@@ -1,6 +1,7 @@
 import type { CliDeps } from "../cli/deps.js";
 import { info, success } from "../globals.js";
 import type { RuntimeEnv } from "../runtime.js";
+import type { Provider } from "../utils.js";
 import { sendViaIpc } from "../web/ipc.js";
 
 export async function sendCommand(
@@ -10,10 +11,53 @@ export async function sendCommand(
     json?: boolean;
     dryRun?: boolean;
     media?: string;
+    provider?: Provider;
   },
   deps: CliDeps,
   runtime: RuntimeEnv,
 ) {
+  const provider = opts.provider ?? "web";
+
+  // Telegram provider
+  if (provider === "telegram") {
+    if (opts.dryRun) {
+      runtime.log(
+        `[dry-run] would send via telegram -> ${opts.to}: ${opts.message}${opts.media ? ` (media ${opts.media})` : ""}`,
+      );
+      return;
+    }
+
+    const result = await deps
+      .sendTelegramMessage(opts.to, opts.message, {
+        mediaUrl: opts.media,
+      })
+      .catch((err) => {
+        runtime.error(`❌ Telegram send failed: ${String(err)}`);
+        throw err;
+      });
+
+    runtime.log(
+      success(`✅ Sent via Telegram. Message ID: ${result.messageId}`),
+    );
+    if (opts.json) {
+      runtime.log(
+        JSON.stringify(
+          {
+            provider: "telegram",
+            to: opts.to,
+            messageId: result.messageId,
+            chatId: result.chatId,
+            mediaUrl: opts.media ?? null,
+          },
+          null,
+          2,
+        ),
+      );
+    }
+    return;
+  }
+
+  // Web provider (default)
   if (opts.dryRun) {
     runtime.log(
       `[dry-run] would send via web -> ${opts.to}: ${opts.message}${opts.media ? ` (media ${opts.media})` : ""}`,

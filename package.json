@@ -37,6 +37,7 @@
     "commander": "^14.0.2",
     "dotenv": "^17.2.3",
     "express": "^5.1.0",
+    "grammy": "^1.38.4",
     "json5": "^2.2.3",
     "pino": "^10.1.0",
     "qrcode-terminal": "^0.12.0",
