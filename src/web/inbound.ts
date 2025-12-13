@@ -6,6 +6,7 @@ import type {
 import {
   DisconnectReason,
   downloadMediaMessage,
+  isJidGroup,
 } from "@whiskeysockets/baileys";
 
 import { loadConfig } from "../config/config.js";
@@ -27,11 +28,22 @@ export type WebListenerCloseReason = {
 
 export type WebInboundMessage = {
   id?: string;
-  from: string;
+  from: string; // conversation id: E.164 for direct chats, group JID for groups
+  conversationId: string; // alias for clarity (same as from)
   to: string;
   body: string;
   pushName?: string;
   timestamp?: number;
+  chatType: "direct" | "group";
+  chatId: string;
+  senderJid?: string;
+  senderE164?: string;
+  senderName?: string;
+  groupSubject?: string;
+  groupParticipants?: string[];
+  mentionedJids?: string[];
+  selfJid?: string | null;
+  selfE164?: string | null;
   sendComposing: () => Promise<void>;
   reply: (text: string) => Promise<void>;
   sendMedia: (payload: AnyMessageContent) => Promise<void>;
@@ -63,6 +75,33 @@ export async function monitorWebInbox(options: {
   const selfJid = sock.user?.id;
   const selfE164 = selfJid ? jidToE164(selfJid) : null;
   const seen = new Set<string>();
+  const groupMetaCache = new Map<
+    string,
+    { subject?: string; participants?: string[]; expires: number }
+  >();
+  const GROUP_META_TTL_MS = 5 * 60 * 1000; // 5 minutes
+
+  const getGroupMeta = async (jid: string) => {
+    const cached = groupMetaCache.get(jid);
+    if (cached && cached.expires > Date.now()) return cached;
+    try {
+      const meta = await sock.groupMetadata(jid);
+      const participants =
+        meta.participants
+          ?.map((p) => jidToE164(p.id) ?? p.id)
+          .filter(Boolean) ?? [];
+      const entry = {
+        subject: meta.subject,
+        participants,
+        expires: Date.now() + GROUP_META_TTL_MS,
+      };
+      groupMetaCache.set(jid, entry);
+      return entry;
+    } catch (err) {
+      logVerbose(`Failed to fetch group metadata for ${jid}: ${String(err)}`);
+      return { expires: Date.now() + GROUP_META_TTL_MS };
+    }
+  };
 
   sock.ev.on("messages.upsert", async (upsert) => {
     if (upsert.type !== "notify") return;
@@ -93,8 +132,19 @@ export async function monitorWebInbox(options: {
           logVerbose(`Failed to mark message ${id} read: ${String(err)}`);
         }
       }
-      const from = jidToE164(remoteJid);
+      const group = isJidGroup(remoteJid);
+      const participantJid = msg.key?.participant ?? undefined;
+      const senderE164 = participantJid ? jidToE164(participantJid) : null;
+      const from = group ? remoteJid : jidToE164(remoteJid);
+      // Skip if we still can't resolve an id to key conversation
       if (!from) continue;
+      let groupSubject: string | undefined;
+      let groupParticipants: string[] | undefined;
+      if (group) {
+        const meta = await getGroupMeta(remoteJid);
+        groupSubject = meta.subject;
+        groupParticipants = meta.participants;
+      }
 
       // Filter unauthorized senders early to prevent wasted processing
       // and potential session corruption from Bad MAC errors
@@ -102,13 +152,14 @@ export async function monitorWebInbox(options: {
       const allowFrom = cfg.inbound?.allowFrom;
       const isSamePhone = from === selfE164;
 
-      if (!isSamePhone && Array.isArray(allowFrom) && allowFrom.length > 0) {
-        if (
-          !allowFrom.includes("*") &&
-          !allowFrom.map(normalizeE164).includes(from)
-        ) {
+      const allowlistEnabled =
+        !group && Array.isArray(allowFrom) && allowFrom.length > 0;
+      if (!isSamePhone && allowlistEnabled) {
+        const candidate = from;
+        const allowedList = allowFrom.map(normalizeE164);
+        if (!allowFrom.includes("*") && !allowedList.includes(candidate)) {
           logVerbose(
-            `Blocked unauthorized sender ${from} (not in allowFrom list)`,
+            `Blocked unauthorized sender ${candidate} (not in allowFrom list)`,
           );
           continue; // Skip processing entirely
         }
@@ -151,6 +202,10 @@ export async function monitorWebInbox(options: {
       const timestamp = msg.messageTimestamp
         ? Number(msg.messageTimestamp) * 1000
         : undefined;
+      const mentionedJids = extractMentionedJids(
+        msg.message as proto.IMessage | undefined,
+      );
+      const senderName = msg.pushName ?? undefined;
       inboundLogger.info(
         {
           from,
@@ -166,10 +221,21 @@ export async function monitorWebInbox(options: {
         await options.onMessage({
           id,
           from,
+          conversationId: from,
           to: selfE164 ?? "me",
           body,
-          pushName: msg.pushName ?? undefined,
+          pushName: senderName,
           timestamp,
+          chatType: group ? "group" : "direct",
+          chatId: remoteJid,
+          senderJid: participantJid,
+          senderE164: senderE164 ?? undefined,
+          senderName,
+          groupSubject,
+          groupParticipants,
+          mentionedJids: mentionedJids ?? undefined,
+          selfJid,
+          selfE164,
           sendComposing,
           reply,
           sendMedia,
@@ -273,9 +339,51 @@ export async function monitorWebInbox(options: {
   } as const;
 }
 
-export function extractText(
+function unwrapMessage(
   message: proto.IMessage | undefined,
+): proto.IMessage | undefined {
+  if (!message) return undefined;
+  if (message.ephemeralMessage?.message) {
+    return unwrapMessage(message.ephemeralMessage.message as proto.IMessage);
+  }
+  if (message.viewOnceMessage?.message) {
+    return unwrapMessage(message.viewOnceMessage.message as proto.IMessage);
+  }
+  if (message.viewOnceMessageV2?.message) {
+    return unwrapMessage(message.viewOnceMessageV2.message as proto.IMessage);
+  }
+  return message;
+}
+
+function extractMentionedJids(
+  rawMessage: proto.IMessage | undefined,
+): string[] | undefined {
+  const message = unwrapMessage(rawMessage);
+  if (!message) return undefined;
+
+  const candidates: Array<string[] | null | undefined> = [
+    message.extendedTextMessage?.contextInfo?.mentionedJid,
+    message.extendedTextMessage?.contextInfo?.quotedMessage?.extendedTextMessage
+      ?.contextInfo?.mentionedJid,
+    message.imageMessage?.contextInfo?.mentionedJid,
+    message.videoMessage?.contextInfo?.mentionedJid,
+    message.documentMessage?.contextInfo?.mentionedJid,
+    message.audioMessage?.contextInfo?.mentionedJid,
+    message.stickerMessage?.contextInfo?.mentionedJid,
+    message.buttonsResponseMessage?.contextInfo?.mentionedJid,
+    message.listResponseMessage?.contextInfo?.mentionedJid,
+  ];
+
+  const flattened = candidates.flatMap((arr) => arr ?? []).filter(Boolean);
+  if (flattened.length === 0) return undefined;
+  // De-dupe
+  return Array.from(new Set(flattened));
+}
+
+export function extractText(
+  rawMessage: proto.IMessage | undefined,
 ): string | undefined {
+  const message = unwrapMessage(rawMessage);
   if (!message) return undefined;
   if (typeof message.conversation === "string" && message.conversation.trim()) {
     return message.conversation.trim();
@@ -289,8 +397,9 @@ export function extractText(
 }
 
 export function extractMediaPlaceholder(
-  message: proto.IMessage | undefined,
+  rawMessage: proto.IMessage | undefined,
 ): string | undefined {
+  const message = unwrapMessage(rawMessage);
   if (!message) return undefined;
   if (message.imageMessage) return "<media:image>";
   if (message.videoMessage) return "<media:video>";
@@ -304,7 +413,7 @@ async function downloadInboundMedia(
   msg: proto.IWebMessageInfo,
   sock: Awaited<ReturnType<typeof createWaSocket>>,
 ): Promise<{ buffer: Buffer; mimetype?: string } | undefined> {
-  const message = msg.message;
+  const message = unwrapMessage(msg.message as proto.IMessage | undefined);
   if (!message) return undefined;
   const mimetype =
     message.imageMessage?.mimetype ??

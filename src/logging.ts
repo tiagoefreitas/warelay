@@ -1,13 +1,19 @@
 import fs from "node:fs";
-import os from "node:os";
 import path from "node:path";
+import util from "node:util";
 
 import pino, { type Bindings, type LevelWithSilent, type Logger } from "pino";
 import { loadConfig, type WarelayConfig } from "./config/config.js";
 import { isVerbose } from "./globals.js";
 
-const DEFAULT_LOG_DIR = path.join(os.tmpdir(), "warelay");
-export const DEFAULT_LOG_FILE = path.join(DEFAULT_LOG_DIR, "warelay.log");
+// Pin to /tmp so mac Debug UI and docs match; os.tmpdir() can be a per-user
+// randomized path on macOS which made the “Open log” button a no-op.
+export const DEFAULT_LOG_DIR = "/tmp/clawdis";
+export const DEFAULT_LOG_FILE = path.join(DEFAULT_LOG_DIR, "clawdis.log"); // legacy single-file path
+
+const LOG_PREFIX = "clawdis";
+const LOG_SUFFIX = ".log";
+const MAX_LOG_AGE_MS = 24 * 60 * 60 * 1000; // 24h
 
 const ALLOWED_LEVELS: readonly LevelWithSilent[] = [
   "silent",
@@ -33,9 +39,10 @@ export type LoggerResolvedSettings = ResolvedSettings;
 let cachedLogger: Logger | null = null;
 let cachedSettings: ResolvedSettings | null = null;
 let overrideSettings: LoggerSettings | null = null;
+let consolePatched = false;
 
 function normalizeLevel(level?: string): LevelWithSilent {
-  if (isVerbose()) return "debug";
+  if (isVerbose()) return "trace";
   const candidate = level ?? "info";
   return ALLOWED_LEVELS.includes(candidate as LevelWithSilent)
     ? (candidate as LevelWithSilent)
@@ -46,7 +53,7 @@ function resolveSettings(): ResolvedSettings {
   const cfg: WarelayConfig["logging"] | undefined =
     overrideSettings ?? loadConfig().logging;
   const level = normalizeLevel(cfg?.level);
-  const file = cfg?.file ?? DEFAULT_LOG_FILE;
+  const file = cfg?.file ?? defaultRollingPathForToday();
   return { level, file };
 }
 
@@ -57,6 +64,10 @@ function settingsChanged(a: ResolvedSettings | null, b: ResolvedSettings) {
 
 function buildLogger(settings: ResolvedSettings): Logger {
   fs.mkdirSync(path.dirname(settings.file), { recursive: true });
+  // Clean up stale rolling logs when using a dated log filename.
+  if (isRollingPath(settings.file)) {
+    pruneOldRollingLogs(path.dirname(settings.file));
+  }
   const destination = pino.destination({
     dest: settings.file,
     mkdir: true,
@@ -103,4 +114,96 @@ export function resetLogger() {
   cachedLogger = null;
   cachedSettings = null;
   overrideSettings = null;
+}
+
+/**
+ * Route console.* calls through pino while still emitting to stdout/stderr.
+ * This keeps user-facing output unchanged but guarantees every console call is captured in log files.
+ */
+export function enableConsoleCapture(): void {
+  if (consolePatched) return;
+  consolePatched = true;
+
+  const logger = getLogger();
+
+  const original = {
+    log: console.log,
+    info: console.info,
+    warn: console.warn,
+    error: console.error,
+    debug: console.debug,
+    trace: console.trace,
+  };
+
+  const forward =
+    (level: LevelWithSilent, orig: (...args: unknown[]) => void) =>
+    (...args: unknown[]) => {
+      const formatted = util.format(...args);
+      try {
+        // Map console levels to pino
+        if (level === "trace") {
+          logger.trace(formatted);
+        } else if (level === "debug") {
+          logger.debug(formatted);
+        } else if (level === "info") {
+          logger.info(formatted);
+        } else if (level === "warn") {
+          logger.warn(formatted);
+        } else if (level === "error" || level === "fatal") {
+          logger.error(formatted);
+        } else {
+          logger.info(formatted);
+        }
+      } catch {
+        // never block console output on logging failures
+      }
+      orig.apply(console, args as []);
+    };
+
+  console.log = forward("info", original.log);
+  console.info = forward("info", original.info);
+  console.warn = forward("warn", original.warn);
+  console.error = forward("error", original.error);
+  console.debug = forward("debug", original.debug);
+  console.trace = forward("trace", original.trace);
+}
+
+function defaultRollingPathForToday(): string {
+  const today = new Date().toISOString().slice(0, 10); // YYYY-MM-DD
+  return path.join(DEFAULT_LOG_DIR, `${LOG_PREFIX}-${today}${LOG_SUFFIX}`);
+}
+
+function isRollingPath(file: string): boolean {
+  const base = path.basename(file);
+  return (
+    base.startsWith(`${LOG_PREFIX}-`) &&
+    base.endsWith(LOG_SUFFIX) &&
+    base.length === `${LOG_PREFIX}-YYYY-MM-DD${LOG_SUFFIX}`.length
+  );
+}
+
+function pruneOldRollingLogs(dir: string): void {
+  try {
+    const entries = fs.readdirSync(dir, { withFileTypes: true });
+    const cutoff = Date.now() - MAX_LOG_AGE_MS;
+    for (const entry of entries) {
+      if (!entry.isFile()) continue;
+      if (
+        !entry.name.startsWith(`${LOG_PREFIX}-`) ||
+        !entry.name.endsWith(LOG_SUFFIX)
+      )
+        continue;
+      const fullPath = path.join(dir, entry.name);
+      try {
+        const stat = fs.statSync(fullPath);
+        if (stat.mtimeMs < cutoff) {
+          fs.rmSync(fullPath, { force: true });
+        }
+      } catch {
+        // ignore errors during pruning
+      }
+    }
+  } catch {
+    // ignore missing dir or read errors
+  }
 }

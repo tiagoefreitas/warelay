@@ -169,7 +169,7 @@ describe("web monitor inbox", () => {
   it("logs inbound bodies to file", async () => {
     const logPath = path.join(
       os.tmpdir(),
-      `warelay-log-test-${crypto.randomUUID()}.log`,
+      `clawdis-log-test-${crypto.randomUUID()}.log`,
     );
     setLoggerOverride({ level: "trace", file: logPath });
 
@@ -230,6 +230,143 @@ describe("web monitor inbox", () => {
     await listener.close();
   });
 
+  it("passes through group messages with participant metadata", async () => {
+    const onMessage = vi.fn();
+    const listener = await monitorWebInbox({ verbose: false, onMessage });
+    const sock = await createWaSocket();
+    const upsert = {
+      type: "notify",
+      messages: [
+        {
+          key: {
+            id: "grp2",
+            fromMe: false,
+            remoteJid: "99999@g.us",
+            participant: "777@s.whatsapp.net",
+          },
+          pushName: "Alice",
+          message: {
+            extendedTextMessage: {
+              text: "@bot ping",
+              contextInfo: { mentionedJid: ["123@s.whatsapp.net"] },
+            },
+          },
+          messageTimestamp: 1_700_000_000,
+        },
+      ],
+    };
+
+    sock.ev.emit("messages.upsert", upsert);
+    await new Promise((resolve) => setImmediate(resolve));
+
+    expect(onMessage).toHaveBeenCalledWith(
+      expect.objectContaining({
+        chatType: "group",
+        conversationId: "99999@g.us",
+        senderE164: "+777",
+        mentionedJids: ["123@s.whatsapp.net"],
+      }),
+    );
+    await listener.close();
+  });
+
+  it("unwraps ephemeral messages, preserves mentions, and still delivers group pings", async () => {
+    const onMessage = vi.fn();
+    const listener = await monitorWebInbox({ verbose: false, onMessage });
+    const sock = await createWaSocket();
+    const upsert = {
+      type: "notify",
+      messages: [
+        {
+          key: {
+            id: "grp-ephem",
+            fromMe: false,
+            remoteJid: "424242@g.us",
+            participant: "888@s.whatsapp.net",
+          },
+          message: {
+            ephemeralMessage: {
+              message: {
+                extendedTextMessage: {
+                  text: "oh hey @Clawd UK !",
+                  contextInfo: { mentionedJid: ["123@s.whatsapp.net"] },
+                },
+              },
+            },
+          },
+        },
+      ],
+    };
+
+    sock.ev.emit("messages.upsert", upsert);
+    await new Promise((resolve) => setImmediate(resolve));
+
+    expect(onMessage).toHaveBeenCalledTimes(1);
+    expect(onMessage).toHaveBeenCalledWith(
+      expect.objectContaining({
+        chatType: "group",
+        conversationId: "424242@g.us",
+        body: "oh hey @Clawd UK !",
+        mentionedJids: ["123@s.whatsapp.net"],
+        senderE164: "+888",
+      }),
+    );
+
+    await listener.close();
+  });
+
+  it("still forwards group messages (with sender info) even when allowFrom is restrictive", async () => {
+    mockLoadConfig.mockReturnValue({
+      inbound: {
+        allowFrom: ["+111"], // does not include +777
+        messagePrefix: undefined,
+        responsePrefix: undefined,
+        timestampPrefix: false,
+      },
+    });
+
+    const onMessage = vi.fn();
+    const listener = await monitorWebInbox({ verbose: false, onMessage });
+    const sock = await createWaSocket();
+    const upsert = {
+      type: "notify",
+      messages: [
+        {
+          key: {
+            id: "grp-allow",
+            fromMe: false,
+            remoteJid: "55555@g.us",
+            participant: "777@s.whatsapp.net",
+          },
+          message: {
+            extendedTextMessage: {
+              text: "@bot hi",
+              contextInfo: { mentionedJid: ["123@s.whatsapp.net"] },
+            },
+          },
+        },
+      ],
+    };
+
+    sock.ev.emit("messages.upsert", upsert);
+    await new Promise((resolve) => setImmediate(resolve));
+
+    expect(onMessage).toHaveBeenCalledTimes(1);
+    expect(onMessage).toHaveBeenCalledWith(
+      expect.objectContaining({
+        chatType: "group",
+        from: "55555@g.us",
+        senderE164: "+777",
+        senderJid: "777@s.whatsapp.net",
+        mentionedJids: ["123@s.whatsapp.net"],
+        selfE164: "+123",
+        selfJid: "123@s.whatsapp.net",
+      }),
+    );
+
+    await listener.close();
+  });
+
   it("blocks messages from unauthorized senders not in allowFrom", async () => {
     // Test for auto-recovery fix: early allowFrom filtering prevents Bad MAC errors
     // from unauthorized senders corrupting sessions
@@ -277,6 +414,46 @@ describe("web monitor inbox", () => {
         timestampPrefix: false,
       },
     });
+
+    await listener.close();
+  });
+
+  it("lets group messages through even when sender not in allowFrom", async () => {
+    mockLoadConfig.mockReturnValue({
+      inbound: {
+        allowFrom: ["+1234"],
+        messagePrefix: undefined,
+        responsePrefix: undefined,
+        timestampPrefix: false,
+      },
+    });
+
+    const onMessage = vi.fn();
+    const listener = await monitorWebInbox({ verbose: false, onMessage });
+    const sock = await createWaSocket();
+
+    const upsert = {
+      type: "notify",
+      messages: [
+        {
+          key: {
+            id: "grp3",
+            fromMe: false,
+            remoteJid: "11111@g.us",
+            participant: "999@s.whatsapp.net",
+          },
+          message: { conversation: "unauthorized group message" },
+        },
+      ],
+    };
+
+    sock.ev.emit("messages.upsert", upsert);
+    await new Promise((resolve) => setImmediate(resolve));
+
+    expect(onMessage).toHaveBeenCalledTimes(1);
+    const payload = onMessage.mock.calls[0][0];
+    expect(payload.chatType).toBe("group");
+    expect(payload.senderE164).toBe("+999");
 
     await listener.close();
   });

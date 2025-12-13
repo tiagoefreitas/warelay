@@ -1,52 +1,51 @@
 import chalk from "chalk";
 import { Command } from "commander";
+import { agentCommand } from "../commands/agent.js";
+import { healthCommand } from "../commands/health.js";
 import { sendCommand } from "../commands/send.js";
+import { sessionsCommand } from "../commands/sessions.js";
 import { statusCommand } from "../commands/status.js";
-import { webhookCommand } from "../commands/webhook.js";
 import { loadConfig } from "../config/config.js";
-import { ensureTwilioEnv } from "../env.js";
-import { danger, info, setVerbose, setYes } from "../globals.js";
+import { danger, info, setVerbose } from "../globals.js";
 import { getResolvedLoggerSettings } from "../logging.js";
 import {
   loginWeb,
   logoutWeb,
   monitorWebProvider,
-  pickProvider,
   resolveHeartbeatRecipients,
   runWebHeartbeatOnce,
+  setHeartbeatsEnabled,
   type WebMonitorTuning,
 } from "../provider-web.js";
-import { defaultRuntime } from "../runtime.js";
-import { runTwilioHeartbeatOnce } from "../twilio/heartbeat.js";
-import type { Provider } from "../utils.js";
+import {
+  deleteTelegramToken,
+  saveTelegramToken,
+} from "../providers/telegram/index.js";
+import { defaultRuntime, type RuntimeEnv } from "../runtime.js";
+import { assertProvider } from "../utils.js";
 import { VERSION } from "../version.js";
 import {
   resolveHeartbeatSeconds,
   resolveReconnectPolicy,
 } from "../web/reconnect.js";
-import {
-  createDefaultDeps,
-  logTwilioFrom,
-  logWebSelfId,
-  monitorTwilio,
-} from "./deps.js";
+import { createDefaultDeps, logWebSelfId, monitorTelegram } from "./deps.js";
 import { spawnRelayTmux } from "./relay_tmux.js";
 
 export function buildProgram() {
   const program = new Command();
   const PROGRAM_VERSION = VERSION;
   const TAGLINE =
-    "Send, receive, and auto-reply on WhatsApp—Twilio-backed or QR-linked.";
+    "Send, receive, and auto-reply on WhatsApp—Baileys (web) only.";
 
   program
-    .name("warelay")
-    .description("WhatsApp relay CLI (Twilio or WhatsApp Web session)")
+    .name("clawdis")
+    .description("WhatsApp relay CLI (WhatsApp Web session only)")
     .version(PROGRAM_VERSION);
 
   const formatIntroLine = (version: string, rich = true) => {
-    const base = `📡 warelay ${version} — ${TAGLINE}`;
+    const base = `📡 clawdis ${version} — ${TAGLINE}`;
     return rich && chalk.level > 0
-      ? `${chalk.bold.cyan("📡 warelay")} ${chalk.white(version)} ${chalk.gray("—")} ${chalk.green(TAGLINE)}`
+      ? `${chalk.bold.cyan("📡 clawdis")} ${chalk.white(version)} ${chalk.gray("—")} ${chalk.green(TAGLINE)}`
       : base;
   };
 
@@ -75,24 +74,28 @@ export function buildProgram() {
   program.addHelpText("beforeAll", `\n${formatIntroLine(PROGRAM_VERSION)}\n`);
   const examples = [
     [
-      "warelay login --verbose",
+      "clawdis login --verbose",
       "Link personal WhatsApp Web and show QR + connection logs.",
     ],
     [
-      'warelay send --to +15551234567 --message "Hi" --provider web --json',
+      'clawdis send --to +15555550123 --message "Hi" --json',
       "Send via your web session and print JSON result.",
     ],
     [
-      "warelay relay --provider auto --interval 5 --lookback 15 --verbose",
-      "Auto-reply loop: prefer Web when logged in, otherwise Twilio polling.",
+      "clawdis relay --verbose",
+      "Auto-reply loop using your linked web session.",
     ],
     [
-      "warelay webhook --ingress tailscale --port 42873 --path /webhook/whatsapp --verbose",
-      "Start webhook + Tailscale Funnel and update Twilio callbacks.",
+      "clawdis heartbeat --verbose",
+      "Send a heartbeat ping to your active session or first allowFrom contact.",
     ],
     [
-      "warelay status --limit 10 --lookback 60 --json",
-      "Show last 10 messages from the past hour as JSON.",
+      "clawdis status",
+      "Show web session health and recent session recipients.",
+    ],
+    [
+      'clawdis agent --to +15555550123 --message "Run summary" --deliver',
+      "Talk directly to the agent using the same session handling; optionally send the reply.",
     ],
   ] as const;
 
@@ -107,23 +110,82 @@ export function buildProgram() {
 
   program
     .command("login")
-    .description("Link your personal WhatsApp via QR (web provider)")
+    .description(
+      "Link your personal WhatsApp via QR (web) or Telegram bot token",
+    )
     .option("--verbose", "Verbose connection logs", false)
+    .option("--provider <provider>", "Provider: web | telegram (default: web)")
     .action(async (opts) => {
       setVerbose(Boolean(opts.verbose));
+      const providerInput = opts.provider ?? "web";
       try {
-        await loginWeb(Boolean(opts.verbose));
+        if (providerInput === "telegram") {
+          // Telegram login: prompt for bot token
+          const { createInterface } = await import("node:readline");
+          const rl = createInterface({
+            input: process.stdin,
+            output: process.stdout,
+          });
+          const askQuestion = (q: string): Promise<string> =>
+            new Promise((resolve) => rl.question(q, resolve));
+
+          defaultRuntime.log(
+            info(
+              "Login to Telegram by providing your bot token from @BotFather.",
+            ),
+          );
+          const token = await askQuestion("Bot token: ");
+          rl.close();
+
+          if (!token.trim()) {
+            defaultRuntime.error(danger("Bot token is required."));
+            defaultRuntime.exit(1);
+            return;
+          }
+
+          // Validate token by creating a bot and calling getMe
+          const { createTelegramBot, closeTelegramBot } = await import(
+            "../providers/telegram/index.js"
+          );
+          const bot = createTelegramBot(token.trim());
+          try {
+            const me = await bot.api.getMe();
+            defaultRuntime.log(
+              info(`Logged in as @${me.username} (${me.first_name})`),
+            );
+            await saveTelegramToken(token.trim());
+            defaultRuntime.log(info("Telegram token saved."));
+          } catch (err) {
+            defaultRuntime.error(danger(`Invalid bot token: ${String(err)}`));
+            defaultRuntime.exit(1);
+          } finally {
+            closeTelegramBot();
+          }
+          return;
+        }
+
+        // Web provider (default)
+        const provider =
+          providerInput === "whatsapp" ? "whatsapp" : providerInput;
+        await loginWeb(Boolean(opts.verbose), provider);
       } catch (err) {
-        defaultRuntime.error(danger(`Web login failed: ${String(err)}`));
+        defaultRuntime.error(danger(`Login failed: ${String(err)}`));
         defaultRuntime.exit(1);
       }
     });
 
   program
     .command("logout")
-    .description("Clear cached WhatsApp Web credentials")
-    .action(async () => {
+    .description("Clear cached credentials (web or telegram)")
+    .option("--provider <provider>", "Provider: web | telegram (default: web)")
+    .action(async (opts) => {
       try {
+        const providerInput = opts.provider ?? "web";
+        if (providerInput === "telegram") {
+          await deleteTelegramToken();
+          defaultRuntime.log(info("Telegram token deleted."));
+          return;
+        }
         await logoutWeb(defaultRuntime);
       } catch (err) {
         defaultRuntime.error(danger(`Logout failed: ${String(err)}`));
@@ -133,28 +195,17 @@ export function buildProgram() {
 
   program
     .command("send")
-    .description("Send a WhatsApp message")
+    .description("Send a message (web or telegram)")
     .requiredOption(
       "-t, --to <number>",
-      "Recipient number in E.164 (e.g. +15551234567)",
+      "Recipient: E.164 for web (e.g. +15555550123), chat ID for telegram",
     )
     .requiredOption("-m, --message <text>", "Message body")
     .option(
       "--media <path-or-url>",
-      "Attach image (<=5MB). Web: path or URL. Twilio: https URL or local path hosted via webhook/funnel.",
+      "Attach media (image/audio/video/document). Accepts local paths or URLs.",
     )
-    .option(
-      "--serve-media",
-      "For Twilio: start a temporary media server if webhook is not running",
-      false,
-    )
-    .option(
-      "-w, --wait <seconds>",
-      "Wait for delivery status (0 to skip)",
-      "20",
-    )
-    .option("-p, --poll <seconds>", "Polling interval while waiting", "2")
-    .option("--provider <provider>", "Provider: twilio | web", "twilio")
+    .option("--provider <provider>", "Provider: web | telegram (default: web)")
     .option("--dry-run", "Print payload and skip sending", false)
     .option("--json", "Output result as JSON", false)
     .option("--verbose", "Verbose logging", false)
@@ -162,16 +213,23 @@ export function buildProgram() {
       "after",
       `
 Examples:
-  warelay send --to +15551234567 --message "Hi"                # wait 20s for delivery (default)
-  warelay send --to +15551234567 --message "Hi" --wait 0       # fire-and-forget
-  warelay send --to +15551234567 --message "Hi" --dry-run      # print payload only
-  warelay send --to +15551234567 --message "Hi" --wait 60 --poll 3`,
+  clawdis send --to +15555550123 --message "Hi"
+  clawdis send --to +15555550123 --message "Hi" --media photo.jpg
+  clawdis send --to +15555550123 --message "Hi" --dry-run      # print payload only
+  clawdis send --to +15555550123 --message "Hi" --json         # machine-readable result
+  clawdis send --to 123456789 --message "Hi" --provider telegram`,
     )
     .action(async (opts) => {
       setVerbose(Boolean(opts.verbose));
       const deps = createDefaultDeps();
+      const providerInput = opts.provider ?? "web";
       try {
-        await sendCommand(opts, deps, defaultRuntime);
+        assertProvider(providerInput);
+        await sendCommand(
+          { ...opts, provider: providerInput },
+          deps,
+          defaultRuntime,
+        );
       } catch (err) {
         defaultRuntime.error(String(err));
         defaultRuntime.exit(1);
@@ -179,15 +237,155 @@ Examples:
     });
 
   program
-    .command("heartbeat")
+    .command("agent")
     .description(
-      "Trigger a heartbeat or manual send once (web or twilio, no tmux)",
+      "Talk directly to the configured agent (no WhatsApp send, reuses sessions)",
     )
-    .option("--provider <provider>", "auto | web | twilio", "auto")
+    .requiredOption("-m, --message <text>", "Message body for the agent")
+    .option(
+      "-t, --to <number>",
+      "Recipient number in E.164 used to derive the session key",
+    )
+    .option("--session-id <id>", "Use an explicit session id")
+    .option(
+      "--thinking <level>",
+      "Thinking level: off | minimal | low | medium | high",
+    )
+    .option("--verbose <on|off>", "Persist agent verbose level for the session")
+    .option(
+      "--deliver",
+      "Send the agent's reply back to WhatsApp (requires --to)",
+      false,
+    )
+    .option("--json", "Output result as JSON", false)
+    .option(
+      "--timeout <seconds>",
+      "Override agent command timeout (seconds, default 600 or config value)",
+    )
+    .addHelpText(
+      "after",
+      `
+Examples:
+  clawdis agent --to +15555550123 --message "status update"
+  clawdis agent --session-id 1234 --message "Summarize inbox" --thinking medium
+  clawdis agent --to +15555550123 --message "Trace logs" --verbose on --json
+  clawdis agent --to +15555550123 --message "Summon reply" --deliver
+`,
+    )
+    .action(async (opts) => {
+      const verboseLevel =
+        typeof opts.verbose === "string" ? opts.verbose.toLowerCase() : "";
+      setVerbose(verboseLevel === "on");
+      // Build default deps (keeps parity with other commands; future-proofing).
+      void createDefaultDeps();
+      try {
+        await agentCommand(opts, defaultRuntime);
+      } catch (err) {
+        defaultRuntime.error(String(err));
+        defaultRuntime.exit(1);
+      }
+    });
+
+  program
+    .command("rpc")
+    .description("Run stdin/stdout JSON RPC loop for agent sends")
+    .action(async () => {
+      const { createInterface } = await import("node:readline");
+      const rl = createInterface({ input: process.stdin, crlfDelay: Infinity });
+
+      const respond = (obj: unknown) => {
+        try {
+          console.log(JSON.stringify(obj));
+        } catch (err) {
+          console.error(JSON.stringify({ type: "error", error: String(err) }));
+        }
+      };
+
+      rl.on("line", async (line: string) => {
+        if (!line.trim()) return;
+        try {
+          const cmd = JSON.parse(line);
+          if (cmd.type === "status") {
+            respond({ type: "result", ok: true });
+            return;
+          }
+          if (cmd.type === "set-heartbeats") {
+            setHeartbeatsEnabled(Boolean(cmd.enabled));
+            respond({ type: "result", ok: true });
+            return;
+          }
+          if (cmd.type !== "send" || !cmd.text) {
+            respond({ type: "error", error: "unsupported command" });
+            return;
+          }
+
+          const logs: string[] = [];
+          const runtime: RuntimeEnv = {
+            log: (msg: string) => {
+              logs.push(String(msg));
+              return undefined as unknown as ReturnType<typeof console.log>;
+            },
+            error: (msg: string) => {
+              logs.push(String(msg));
+              return undefined as unknown as ReturnType<typeof console.error>;
+            },
+            exit: (_code: number): never => {
+              throw new Error("exit called in RPC context");
+            },
+          };
+
+          const opts: {
+            message: string;
+            to?: string;
+            sessionId?: string;
+            thinking?: string;
+            deliver?: boolean;
+            json: boolean;
+          } = {
+            message: String(cmd.text),
+            to: cmd.to ? String(cmd.to) : undefined,
+            sessionId: cmd.session ? String(cmd.session) : undefined,
+            thinking: cmd.thinking ? String(cmd.thinking) : undefined,
+            deliver: Boolean(cmd.deliver),
+            json: true,
+          };
+
+          try {
+            await agentCommand(opts, runtime, createDefaultDeps());
+            const payload = extractPayload(logs);
+            respond({ type: "result", ok: true, payload });
+          } catch (err) {
+            respond({ type: "error", error: String(err) });
+          }
+        } catch (err) {
+          respond({ type: "error", error: `parse error: ${String(err)}` });
+        }
+      });
+
+      const extractPayload = (logs: string[]) => {
+        for (const entry of logs.slice().reverse()) {
+          try {
+            const parsed = JSON.parse(entry);
+            if (parsed && typeof parsed === "object" && "payloads" in parsed) {
+              return parsed;
+            }
+          } catch {
+            // non-JSON log, ignore
+          }
+        }
+        return null;
+      };
+
+      await new Promise(() => {});
+    });
+
+  program
+    .command("heartbeat")
+    .description("Trigger a heartbeat or manual send once (web only, no tmux)")
     .option("--to <number>", "Override target E.164; defaults to allowFrom[0]")
     .option(
       "--session-id <id>",
-      "Force a session id for this heartbeat (resumes a specific Claude session)",
+      "Force a session id for this heartbeat (resumes a specific Pi session)",
     )
     .option(
       "--all",
@@ -196,7 +394,7 @@ Examples:
     )
     .option(
       "--message <text>",
-      "Send a custom message instead of the heartbeat probe (web or twilio provider)",
+      "Send a custom message instead of the heartbeat probe",
     )
     .option("--body <text>", "Alias for --message")
     .option("--dry-run", "Print the resolved payload without sending", false)
@@ -205,12 +403,12 @@ Examples:
       "after",
       `
 Examples:
-  warelay heartbeat                 # uses web session + first allowFrom contact
-  warelay heartbeat --verbose       # prints detailed heartbeat logs
-  warelay heartbeat --to +1555123   # override destination
-  warelay heartbeat --session-id <uuid> --to +1555123   # resume a specific session
-  warelay heartbeat --message "Ping" --provider twilio
-  warelay heartbeat --all           # send to every active session recipient or allowFrom entry`,
+  clawdis heartbeat                 # uses web session + first allowFrom contact
+  clawdis heartbeat --verbose       # prints detailed heartbeat logs
+  clawdis heartbeat --to +1555123   # override destination
+  clawdis heartbeat --session-id <uuid> --to +1555123   # resume a specific session
+  clawdis heartbeat --message "Ping"
+  clawdis heartbeat --all           # send to every active session recipient or allowFrom entry`,
     )
     .action(async (opts) => {
       setVerbose(Boolean(opts.verbose));
@@ -242,11 +440,6 @@ Examples:
         );
         defaultRuntime.exit(1);
       }
-      const providerPref = String(opts.provider ?? "auto");
-      if (!["auto", "web", "twilio"].includes(providerPref)) {
-        defaultRuntime.error("--provider must be auto, web, or twilio");
-        defaultRuntime.exit(1);
-      }
 
       const overrideBody =
         (opts.message as string | undefined) ||
@@ -254,32 +447,16 @@ Examples:
         undefined;
       const dryRun = Boolean(opts.dryRun);
 
-      const provider =
-        providerPref === "twilio"
-          ? "twilio"
-          : await pickProvider(providerPref as "auto" | "web");
-      if (provider === "twilio") ensureTwilioEnv();
-
       try {
         for (const to of recipients) {
-          if (provider === "web") {
-            await runWebHeartbeatOnce({
-              to,
-              verbose: Boolean(opts.verbose),
-              runtime: defaultRuntime,
-              sessionId: opts.sessionId,
-              overrideBody,
-              dryRun,
-            });
-          } else {
-            await runTwilioHeartbeatOnce({
-              to,
-              verbose: Boolean(opts.verbose),
-              runtime: defaultRuntime,
-              overrideBody,
-              dryRun,
-            });
-          }
+          await runWebHeartbeatOnce({
+            to,
+            verbose: Boolean(opts.verbose),
+            runtime: defaultRuntime,
+            sessionId: opts.sessionId,
+            overrideBody,
+            dryRun,
+          });
         }
       } catch {
         defaultRuntime.exit(1);
@@ -288,14 +465,8 @@ Examples:
 
   program
     .command("relay")
-    .description("Auto-reply to inbound messages (auto-selects web or twilio)")
-    .option("--provider <provider>", "auto | web | twilio", "auto")
-    .option("-i, --interval <seconds>", "Polling interval for twilio mode", "5")
-    .option(
-      "-l, --lookback <minutes>",
-      "Initial lookback window for twilio mode",
-      "5",
-    )
+    .description("Auto-reply to inbound messages (web or telegram)")
+    .option("--provider <provider>", "Provider: web | telegram (default: web)")
     .option(
       "--web-heartbeat <seconds>",
       "Heartbeat interval for web relay health logs (seconds)",
@@ -311,7 +482,7 @@ Examples:
     .option("--web-retry-max <ms>", "Max reconnect backoff for web relay (ms)")
     .option(
       "--heartbeat-now",
-      "Run a heartbeat immediately when relay starts (web provider)",
+      "Run a heartbeat immediately when relay starts",
       false,
     )
     .option("--verbose", "Verbose logging", false)
@@ -319,24 +490,35 @@ Examples:
       "after",
       `
 Examples:
-  warelay relay                     # auto: web if logged-in, else twilio poll
-  warelay relay --provider web      # force personal web session
-  warelay relay --provider twilio   # force twilio poll
-  warelay relay --provider twilio --interval 2 --lookback 30
+  clawdis relay                     # uses your linked web session
+  clawdis relay --web-heartbeat 60  # override heartbeat interval
+  clawdis relay --provider telegram # use Telegram bot relay
   # Troubleshooting: docs/refactor/web-relay-troubleshooting.md
 `,
     )
     .action(async (opts) => {
       setVerbose(Boolean(opts.verbose));
+      const providerInput = opts.provider ?? "web";
+
+      // Telegram provider
+      if (providerInput === "telegram") {
+        defaultRuntime.log(info("Starting Telegram relay..."));
+        try {
+          await monitorTelegram({
+            runtime: defaultRuntime,
+            verbose: Boolean(opts.verbose),
+          });
+          return;
+        } catch (err) {
+          defaultRuntime.error(danger(`Telegram relay failed: ${String(err)}`));
+          defaultRuntime.exit(1);
+        }
+        return;
+      }
+
+      // Web provider (default)
       const { file: logFile, level: logLevel } = getResolvedLoggerSettings();
       defaultRuntime.log(info(`logs: ${logFile} (level ${logLevel})`));
-      const providerPref = String(opts.provider ?? "auto");
-      if (!["auto", "web", "twilio"].includes(providerPref)) {
-        defaultRuntime.error("--provider must be auto, web, or twilio");
-        defaultRuntime.exit(1);
-      }
-      const intervalSeconds = Number.parseInt(opts.interval, 10);
-      const lookbackMinutes = Number.parseInt(opts.lookback, 10);
       const webHeartbeat =
         opts.webHeartbeat !== undefined
           ? Number.parseInt(String(opts.webHeartbeat), 10)
@@ -354,14 +536,6 @@ Examples:
           ? Number.parseInt(String(opts.webRetryMax), 10)
           : undefined;
       const heartbeatNow = Boolean(opts.heartbeatNow);
-      if (Number.isNaN(intervalSeconds) || intervalSeconds <= 0) {
-        defaultRuntime.error("Interval must be a positive integer");
-        defaultRuntime.exit(1);
-      }
-      if (Number.isNaN(lookbackMinutes) || lookbackMinutes < 0) {
-        defaultRuntime.error("Lookback must be >= 0 minutes");
-        defaultRuntime.exit(1);
-      }
       if (
         webHeartbeat !== undefined &&
         (Number.isNaN(webHeartbeat) || webHeartbeat <= 0)
@@ -409,49 +583,37 @@ Examples:
       if (Object.keys(reconnect).length > 0) {
         webTuning.reconnect = reconnect;
       }
-
-      const provider = await pickProvider(providerPref as Provider | "auto");
-
-      if (provider === "web") {
-        logWebSelfId(defaultRuntime, true);
-        const cfg = loadConfig();
-        const effectiveHeartbeat = resolveHeartbeatSeconds(
-          cfg,
-          webTuning.heartbeatSeconds,
+      logWebSelfId(defaultRuntime, true);
+      const cfg = loadConfig();
+      const effectiveHeartbeat = resolveHeartbeatSeconds(
+        cfg,
+        webTuning.heartbeatSeconds,
+      );
+      const effectivePolicy = resolveReconnectPolicy(cfg, webTuning.reconnect);
+      defaultRuntime.log(
+        info(
+          `Web relay health: heartbeat ${effectiveHeartbeat}s, retries ${effectivePolicy.maxAttempts || "∞"}, backoff ${effectivePolicy.initialMs}→${effectivePolicy.maxMs}ms x${effectivePolicy.factor} (jitter ${Math.round(effectivePolicy.jitter * 100)}%)`,
+        ),
+      );
+      try {
+        await monitorWebProvider(
+          Boolean(opts.verbose),
+          undefined,
+          true,
+          undefined,
+          defaultRuntime,
+          undefined,
+          webTuning,
         );
-        const effectivePolicy = resolveReconnectPolicy(
-          cfg,
-          webTuning.reconnect,
-        );
-        defaultRuntime.log(
-          info(
-            `Web relay health: heartbeat ${effectiveHeartbeat}s, retries ${effectivePolicy.maxAttempts || "∞"}, backoff ${effectivePolicy.initialMs}→${effectivePolicy.maxMs}ms x${effectivePolicy.factor} (jitter ${Math.round(effectivePolicy.jitter * 100)}%)`,
+        return;
+      } catch (err) {
+        defaultRuntime.error(
+          danger(
+            `Web relay failed: ${String(err)}. Re-link with 'clawdis login --verbose'.`,
           ),
         );
-        try {
-          await monitorWebProvider(
-            Boolean(opts.verbose),
-            undefined,
-            true,
-            undefined,
-            defaultRuntime,
-            undefined,
-            webTuning,
-          );
-          return;
-        } catch (err) {
-          defaultRuntime.error(
-            danger(
-              `Web relay failed: ${String(err)}. Not falling back; re-link with 'warelay login --provider web'.`,
-            ),
-          );
-          defaultRuntime.exit(1);
-        }
+        defaultRuntime.exit(1);
       }
-
-      ensureTwilioEnv();
-      logTwilioFrom();
-      await monitorTwilio(intervalSeconds, lookbackMinutes);
     });
 
   program
@@ -459,28 +621,11 @@ Examples:
     .description(
       "Run relay with an immediate heartbeat (no tmux); requires web provider",
     )
-    .option("--provider <provider>", "auto | web", "auto")
     .option("--verbose", "Verbose logging", false)
     .action(async (opts) => {
       setVerbose(Boolean(opts.verbose));
       const { file: logFile, level: logLevel } = getResolvedLoggerSettings();
       defaultRuntime.log(info(`logs: ${logFile} (level ${logLevel})`));
-      const providerPref = String(opts.provider ?? "auto");
-      if (!["auto", "web"].includes(providerPref)) {
-        defaultRuntime.error("--provider must be auto or web");
-        defaultRuntime.exit(1);
-        return;
-      }
-      const provider = await pickProvider(providerPref as "auto" | "web");
-      if (provider !== "web") {
-        defaultRuntime.error(
-          danger(
-            "Heartbeat relay is only supported for the web provider. Link with `warelay login --verbose`.",
-          ),
-        );
-        defaultRuntime.exit(1);
-        return;
-      }
 
       logWebSelfId(defaultRuntime, true);
       const cfg = loadConfig();
@@ -505,7 +650,7 @@ Examples:
       } catch (err) {
         defaultRuntime.error(
           danger(
-            `Web relay failed: ${String(err)}. Re-link with 'warelay login --provider web'.`,
+            `Web relay failed: ${String(err)}. Re-link with 'clawdis login --provider web'.`,
           ),
         );
         defaultRuntime.exit(1);
@@ -514,24 +659,20 @@ Examples:
 
   program
     .command("status")
-    .description("Show recent WhatsApp messages (sent and received)")
-    .option("-l, --limit <count>", "Number of messages to show", "20")
-    .option("-b, --lookback <minutes>", "How far back to fetch messages", "240")
+    .description("Show web session health and recent session recipients")
     .option("--json", "Output JSON instead of text", false)
     .option("--verbose", "Verbose logging", false)
     .addHelpText(
       "after",
       `
 Examples:
-  warelay status                            # last 20 msgs in past 4h
-  warelay status --limit 5 --lookback 30    # last 5 msgs in past 30m
-  warelay status --json --limit 50          # machine-readable output`,
+  clawdis status                   # show linked account + session store summary
+  clawdis status --json            # machine-readable output`,
     )
     .action(async (opts) => {
       setVerbose(Boolean(opts.verbose));
-      const deps = createDefaultDeps();
       try {
-        await statusCommand(opts, deps, defaultRuntime);
+        await statusCommand(opts, defaultRuntime);
       } catch (err) {
         defaultRuntime.error(String(err));
         defaultRuntime.exit(1);
@@ -539,73 +680,89 @@ Examples:
     });
 
   program
-    .command("webhook")
+    .command("health")
     .description(
-      "Run inbound webhook. ingress=tailscale updates Twilio; ingress=none stays local-only.",
+      "Probe WhatsApp Web health (creds + Baileys connect) and session store",
     )
-    .option("-p, --port <port>", "Port to listen on", "42873")
-    .option("-r, --reply <text>", "Optional auto-reply text")
-    .option("--path <path>", "Webhook path", "/webhook/whatsapp")
-    .option(
-      "--ingress <mode>",
-      "Ingress: tailscale (funnel + Twilio update) | none (local only)",
-      "tailscale",
-    )
-    .option("--verbose", "Log inbound and auto-replies", false)
-    .option("-y, --yes", "Auto-confirm prompts when possible", false)
-    .option("--dry-run", "Print planned actions without starting server", false)
-    .addHelpText(
-      "after",
-      `
-Examples:
-  warelay webhook                       # ingress=tailscale (funnel + Twilio update)
-  warelay webhook --ingress none        # local-only server (no funnel / no Twilio update)
-  warelay webhook --port 45000          # pick a high, less-colliding port
-  warelay webhook --reply "Got it!"     # static auto-reply; otherwise use config file`,
-    )
-    // istanbul ignore next
+    .option("--json", "Output JSON instead of text", false)
+    .option("--timeout <ms>", "Connection timeout in milliseconds", "10000")
+    .option("--verbose", "Verbose logging", false)
     .action(async (opts) => {
       setVerbose(Boolean(opts.verbose));
-      setYes(Boolean(opts.yes));
-      const deps = createDefaultDeps();
+      const timeout = opts.timeout
+        ? Number.parseInt(String(opts.timeout), 10)
+        : undefined;
+      if (timeout !== undefined && (Number.isNaN(timeout) || timeout <= 0)) {
+        defaultRuntime.error(
+          "--timeout must be a positive integer (milliseconds)",
+        );
+        defaultRuntime.exit(1);
+        return;
+      }
       try {
-        const server = await webhookCommand(opts, deps, defaultRuntime);
-        if (!server) {
-          defaultRuntime.log(
-            info("Webhook dry-run complete; no server started."),
-          );
-          return;
-        }
-        process.on("SIGINT", () => {
-          server.close(() => {
-            console.log("\n👋 Webhook stopped");
-            defaultRuntime.exit(0);
-          });
-        });
-        await deps.waitForever();
+        await healthCommand(
+          { json: Boolean(opts.json), timeoutMs: timeout },
+          defaultRuntime,
+        );
       } catch (err) {
         defaultRuntime.error(String(err));
         defaultRuntime.exit(1);
       }
+    });
+
+  program
+    .command("sessions")
+    .description("List stored conversation sessions")
+    .option("--json", "Output as JSON", false)
+    .option("--verbose", "Verbose logging", false)
+    .option(
+      "--store <path>",
+      "Path to session store (default: resolved from config)",
+    )
+    .option(
+      "--active <minutes>",
+      "Only show sessions updated within the past N minutes",
+    )
+    .addHelpText(
+      "after",
+      `
+Examples:
+  clawdis sessions                 # list all sessions
+  clawdis sessions --active 120    # only last 2 hours
+  clawdis sessions --json          # machine-readable output
+  clawdis sessions --store ./tmp/sessions.json
+
+Shows token usage per session when the agent reports it; set inbound.reply.agent.contextTokens to see % of your model window.`,
+    )
+    .action(async (opts) => {
+      setVerbose(Boolean(opts.verbose));
+      await sessionsCommand(
+        {
+          json: Boolean(opts.json),
+          store: opts.store as string | undefined,
+          active: opts.active as string | undefined,
+        },
+        defaultRuntime,
+      );
     });
 
   program
     .command("relay:tmux")
     .description(
-      "Run relay --verbose inside tmux (session warelay-relay), restarting if already running, then attach",
+      "Run relay --verbose inside tmux (session clawdis-relay), restarting if already running, then attach",
     )
     .action(async () => {
       try {
         const shouldAttach = Boolean(process.stdout.isTTY);
         const session = await spawnRelayTmux(
-          "pnpm warelay relay --verbose",
+          "pnpm clawdis relay --verbose",
           shouldAttach,
         );
         defaultRuntime.log(
           info(
             shouldAttach
-              ? `tmux session started and attached: ${session} (pane running "pnpm warelay relay --verbose")`
-              : `tmux session started: ${session} (pane running "pnpm warelay relay --verbose"); attach manually with "tmux attach -t ${session}"`,
+              ? `tmux session started and attached: ${session} (pane running "pnpm clawdis relay --verbose")`
+              : `tmux session started: ${session} (pane running "pnpm clawdis relay --verbose"); attach manually with "tmux attach -t ${session}"`,
           ),
         );
       } catch (err) {
@@ -619,24 +776,24 @@ Examples:
   program
     .command("relay:tmux:attach")
     .description(
-      "Attach to the existing warelay-relay tmux session (no restart)",
+      "Attach to the existing clawdis-relay tmux session (no restart)",
     )
     .action(async () => {
       try {
         if (!process.stdout.isTTY) {
           defaultRuntime.error(
             danger(
-              "Cannot attach: stdout is not a TTY. Run this in a terminal or use 'tmux attach -t warelay-relay' manually.",
+              "Cannot attach: stdout is not a TTY. Run this in a terminal or use 'tmux attach -t clawdis-relay' manually.",
             ),
           );
           defaultRuntime.exit(1);
           return;
         }
-        await spawnRelayTmux("pnpm warelay relay --verbose", true, false);
-        defaultRuntime.log(info("Attached to warelay-relay session."));
+        await spawnRelayTmux("pnpm clawdis relay --verbose", true, false);
+        defaultRuntime.log(info("Attached to clawdis-relay session."));
       } catch (err) {
         defaultRuntime.error(
-          danger(`Failed to attach to warelay-relay: ${String(err)}`),
+          danger(`Failed to attach to clawdis-relay: ${String(err)}`),
         );
         defaultRuntime.exit(1);
       }
@@ -645,20 +802,20 @@ Examples:
   program
     .command("relay:heartbeat:tmux")
     .description(
-      "Run relay --verbose with an immediate heartbeat inside tmux (session warelay-relay), then attach",
+      "Run relay --verbose with an immediate heartbeat inside tmux (session clawdis-relay), then attach",
     )
     .action(async () => {
       try {
         const shouldAttach = Boolean(process.stdout.isTTY);
         const session = await spawnRelayTmux(
-          "pnpm warelay relay --verbose --heartbeat-now",
+          "pnpm clawdis relay --verbose --heartbeat-now",
           shouldAttach,
         );
         defaultRuntime.log(
           info(
             shouldAttach
-              ? `tmux session started and attached: ${session} (pane running "pnpm warelay relay --verbose --heartbeat-now")`
-              : `tmux session started: ${session} (pane running "pnpm warelay relay --verbose --heartbeat-now"); attach manually with "tmux attach -t ${session}"`,
+              ? `tmux session started and attached: ${session} (pane running "pnpm clawdis relay --verbose --heartbeat-now")`
+              : `tmux session started: ${session} (pane running "pnpm clawdis relay --verbose --heartbeat-now"); attach manually with "tmux attach -t ${session}"`,
           ),
         );
       } catch (err) {

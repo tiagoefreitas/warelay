@@ -28,7 +28,7 @@ import {
 const makeSessionStore = async (
   entries: Record<string, unknown> = {},
 ): Promise<{ storePath: string; cleanup: () => Promise<void> }> => {
-  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "warelay-session-"));
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "clawdis-session-"));
   const storePath = path.join(dir, "sessions.json");
   await fs.writeFile(storePath, JSON.stringify(entries));
   return {
@@ -229,7 +229,7 @@ describe("runWebHeartbeatOnce", () => {
 
   it("does not refresh updatedAt when heartbeat is skipped", async () => {
     const tmpDir = await fs.mkdtemp(
-      path.join(os.tmpdir(), "warelay-heartbeat-"),
+      path.join(os.tmpdir(), "clawdis-heartbeat-"),
     );
     const storePath = path.join(tmpDir, "sessions.json");
     const now = Date.now();
@@ -269,7 +269,7 @@ describe("runWebHeartbeatOnce", () => {
 
   it("heartbeat reuses existing session id when last inbound is present", async () => {
     const tmpDir = await fs.mkdtemp(
-      path.join(os.tmpdir(), "warelay-heartbeat-session-"),
+      path.join(os.tmpdir(), "clawdis-heartbeat-session-"),
     );
     const storePath = path.join(tmpDir, "sessions.json");
     const sessionId = "sess-keep";
@@ -319,7 +319,7 @@ describe("runWebHeartbeatOnce", () => {
 
   it("heartbeat honors session-id override and seeds store", async () => {
     const tmpDir = await fs.mkdtemp(
-      path.join(os.tmpdir(), "warelay-heartbeat-override-"),
+      path.join(os.tmpdir(), "clawdis-heartbeat-override-"),
     );
     const storePath = path.join(tmpDir, "sessions.json");
     await fs.writeFile(storePath, JSON.stringify({}));
@@ -527,7 +527,7 @@ describe("web auto-reply", () => {
 
   it("skips reply heartbeat when requests are running", async () => {
     const tmpDir = await fs.mkdtemp(
-      path.join(os.tmpdir(), "warelay-heartbeat-queue-"),
+      path.join(os.tmpdir(), "clawdis-heartbeat-queue-"),
     );
     const storePath = path.join(tmpDir, "sessions.json");
     await fs.writeFile(storePath, JSON.stringify({}));
@@ -631,8 +631,8 @@ describe("web auto-reply", () => {
 
     expect(resolver).toHaveBeenCalledTimes(1);
     const args = resolver.mock.calls[0][0];
-    expect(args.Body).toContain("[Jan 1 00:00] [warelay] first");
-    expect(args.Body).toContain("[Jan 1 01:00] [warelay] second");
+    expect(args.Body).toContain("[Jan 1 00:00] [clawdis] first");
+    expect(args.Body).toContain("[Jan 1 01:00] [clawdis] second");
 
     // Max listeners bumped to avoid warnings in multi-instance test runs
     expect(process.getMaxListeners?.()).toBeGreaterThanOrEqual(50);
@@ -699,7 +699,60 @@ describe("web auto-reply", () => {
     });
 
     expect(sendMedia).toHaveBeenCalledTimes(1);
-    expect(reply).toHaveBeenCalledWith("hi");
+    const fallback = reply.mock.calls[0]?.[0] as string;
+    expect(fallback).toContain("hi");
+    expect(fallback).toContain("Media failed");
+    fetchMock.mockRestore();
+  });
+
+  it("returns a warning when remote media fetch 404s", async () => {
+    const sendMedia = vi.fn();
+    const reply = vi.fn().mockResolvedValue(undefined);
+    const sendComposing = vi.fn();
+    const resolver = vi.fn().mockResolvedValue({
+      text: "caption",
+      mediaUrl: "https://example.com/missing.jpg",
+    });
+
+    let capturedOnMessage:
+      | ((msg: import("./inbound.js").WebInboundMessage) => Promise<void>)
+      | undefined;
+    const listenerFactory = async (opts: {
+      onMessage: (
+        msg: import("./inbound.js").WebInboundMessage,
+      ) => Promise<void>;
+    }) => {
+      capturedOnMessage = opts.onMessage;
+      return { close: vi.fn() };
+    };
+
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue({
+      ok: false,
+      status: 404,
+      body: null,
+      arrayBuffer: async () => new ArrayBuffer(0),
+      headers: { get: () => "text/plain" },
+    } as unknown as Response);
+
+    await monitorWebProvider(false, listenerFactory, false, resolver);
+    expect(capturedOnMessage).toBeDefined();
+
+    await capturedOnMessage?.({
+      body: "hello",
+      from: "+1",
+      to: "+2",
+      id: "msg1",
+      sendComposing,
+      reply,
+      sendMedia,
+    });
+
+    expect(sendMedia).not.toHaveBeenCalled();
+    const fallback = reply.mock.calls[0]?.[0] as string;
+    expect(fallback).toContain("caption");
+    expect(fallback).toContain("Media failed");
+    expect(fallback).toContain("404");
+
     fetchMock.mockRestore();
   });
 
@@ -1006,9 +1059,74 @@ describe("web auto-reply", () => {
     fetchMock.mockRestore();
   });
 
+  it("requires mention in group chats and injects history when replying", async () => {
+    const sendMedia = vi.fn();
+    const reply = vi.fn().mockResolvedValue(undefined);
+    const sendComposing = vi.fn();
+    const resolver = vi.fn().mockResolvedValue({ text: "ok" });
+
+    let capturedOnMessage:
+      | ((msg: import("./inbound.js").WebInboundMessage) => Promise<void>)
+      | undefined;
+    const listenerFactory = async (opts: {
+      onMessage: (
+        msg: import("./inbound.js").WebInboundMessage,
+      ) => Promise<void>;
+    }) => {
+      capturedOnMessage = opts.onMessage;
+      return { close: vi.fn() };
+    };
+
+    await monitorWebProvider(false, listenerFactory, false, resolver);
+    expect(capturedOnMessage).toBeDefined();
+
+    await capturedOnMessage?.({
+      body: "hello group",
+      from: "123@g.us",
+      conversationId: "123@g.us",
+      chatId: "123@g.us",
+      chatType: "group",
+      to: "+2",
+      id: "g1",
+      senderE164: "+111",
+      senderName: "Alice",
+      selfE164: "+999",
+      sendComposing,
+      reply,
+      sendMedia,
+    });
+
+    expect(resolver).not.toHaveBeenCalled();
+
+    await capturedOnMessage?.({
+      body: "@bot ping",
+      from: "123@g.us",
+      conversationId: "123@g.us",
+      chatId: "123@g.us",
+      chatType: "group",
+      to: "+2",
+      id: "g2",
+      senderE164: "+222",
+      senderName: "Bob",
+      mentionedJids: ["999@s.whatsapp.net"],
+      selfE164: "+999",
+      selfJid: "999@s.whatsapp.net",
+      sendComposing,
+      reply,
+      sendMedia,
+    });
+
+    expect(resolver).toHaveBeenCalledTimes(1);
+    const payload = resolver.mock.calls[0][0];
+    expect(payload.Body).toContain("Chat messages since your last reply");
+    expect(payload.Body).toContain("Alice: hello group");
+    expect(payload.Body).toContain("@bot ping");
+    expect(payload.Body).toContain("[from: Bob (+222)]");
+  });
+
   it("emits heartbeat logs with connection metadata", async () => {
     vi.useFakeTimers();
-    const logPath = `/tmp/warelay-heartbeat-${crypto.randomUUID()}.log`;
+    const logPath = `/tmp/clawdis-heartbeat-${crypto.randomUUID()}.log`;
     setLoggerOverride({ level: "trace", file: logPath });
 
     const runtime = {
@@ -1050,7 +1168,7 @@ describe("web auto-reply", () => {
   });
 
   it("logs outbound replies to file", async () => {
-    const logPath = `/tmp/warelay-log-test-${crypto.randomUUID()}.log`;
+    const logPath = `/tmp/clawdis-log-test-${crypto.randomUUID()}.log`;
     setLoggerOverride({ level: "trace", file: logPath });
 
     let capturedOnMessage:
@@ -1244,7 +1362,7 @@ describe("web auto-reply", () => {
       sendMedia: vi.fn(),
     });
 
-    // HEARTBEAT_OK should NOT have prefix - warelay needs exact match
+    // HEARTBEAT_OK should NOT have prefix - clawdis needs exact match
     expect(reply).toHaveBeenCalledWith(HEARTBEAT_TOKEN);
     resetLoadConfigMock();
   });

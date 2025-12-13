@@ -1,9 +1,10 @@
-export type AgentKind = "claude" | "opencode" | "pi" | "codex";
+export type AgentKind = "pi";
 
 export type AgentMeta = {
   model?: string;
   provider?: string;
   stopReason?: string;
+  sessionId?: string;
   usage?: {
     input?: number;
     output?: number;
@@ -14,9 +15,17 @@ export type AgentMeta = {
   extra?: Record<string, unknown>;
 };
 
+export type AgentToolResult = {
+  text: string;
+  toolName?: string;
+  meta?: string;
+};
+
 export type AgentParseResult = {
-  text?: string;
+  // Plural to support agents that emit multiple assistant turns per prompt.
+  texts?: string[];
   mediaUrls?: string[];
+  toolResults?: Array<string | AgentToolResult>;
   meta?: AgentMeta;
 };
 

@@ -1,7 +1,6 @@
 import { randomUUID } from "node:crypto";
 import fsSync from "node:fs";
 import fs from "node:fs/promises";
-import os from "node:os";
 import path from "node:path";
 import {
   DisconnectReason,
@@ -12,18 +11,15 @@ import {
 } from "@whiskeysockets/baileys";
 import qrcode from "qrcode-terminal";
 
+import { SESSION_STORE_DEFAULT } from "../config/sessions.js";
 import { danger, info, success } from "../globals.js";
 import { getChildLogger } from "../logging.js";
 import { defaultRuntime, type RuntimeEnv } from "../runtime.js";
 import type { Provider } from "../utils.js";
-import { ensureDir, jidToE164 } from "../utils.js";
+import { CONFIG_DIR, ensureDir, jidToE164 } from "../utils.js";
 import { VERSION } from "../version.js";
 
-export const WA_WEB_AUTH_DIR = path.join(
-  os.homedir(),
-  ".warelay",
-  "credentials",
-);
+export const WA_WEB_AUTH_DIR = path.join(CONFIG_DIR, "credentials");
 
 /**
  * Create a Baileys socket backed by the multi-file auth store we keep on disk.
@@ -52,7 +48,7 @@ export async function createWaSocket(printQr: boolean, verbose: boolean) {
     version,
     logger,
     printQRInTerminal: false,
-    browser: ["warelay", "cli", VERSION],
+    browser: ["clawdis", "cli", VERSION],
     syncFullHistory: false,
     markOnlineOnConnect: false,
   });
@@ -73,7 +69,7 @@ export async function createWaSocket(printQr: boolean, verbose: boolean) {
           const status = getStatusCode(lastDisconnect?.error);
           if (status === DisconnectReason.loggedOut) {
             console.error(
-              danger("WhatsApp session logged out. Run: warelay login"),
+              danger("WhatsApp session logged out. Run: clawdis login"),
             );
           }
         }
@@ -160,11 +156,9 @@ export async function logoutWeb(runtime: RuntimeEnv = defaultRuntime) {
     return false;
   }
   await fs.rm(WA_WEB_AUTH_DIR, { recursive: true, force: true });
-  runtime.log(
-    success(
-      "Cleared WhatsApp Web credentials. Run `warelay login --provider web` to relink.",
-    ),
-  );
+  // Also drop session store to clear lingering per-sender state after logout.
+  await fs.rm(SESSION_STORE_DEFAULT, { force: true });
+  runtime.log(success("Cleared WhatsApp Web credentials."));
   return true;
 }
 
@@ -218,9 +212,12 @@ export function logWebSelfId(
 }
 
 export async function pickProvider(pref: Provider | "auto"): Promise<Provider> {
-  // Auto-select web when logged in; otherwise fall back to twilio.
-  if (pref !== "auto") return pref;
+  const choice: Provider = pref === "auto" ? "web" : pref;
   const hasWeb = await webAuthExists();
-  if (hasWeb) return "web";
-  return "twilio";
+  if (!hasWeb) {
+    throw new Error(
+      "No WhatsApp Web session found. Run `clawdis login --verbose` to link.",
+    );
+  }
+  return choice;
 }

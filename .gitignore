@@ -4,3 +4,7 @@ dist
 pnpm-lock.yaml
 coverage
 .pnpm-store
+**/.DS_Store
+apps/macos/.build/
+bin/clawdis-mac
+apps/macos/.build-local/

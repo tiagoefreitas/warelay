@@ -1,133 +1,173 @@
 # Changelog
 
-## 1.3.0 — Unreleased
+## 2.0.0 — Unreleased
 
-### Highlights
-- **Pluggable agents (Claude, Pi, Codex, Opencode):** New `inbound.reply.agent` block chooses the CLI and parser per command reply; per-agent argv builders inject the right flags/identity/prompt handling and parse NDJSON streams, enabling Pi/Codex swaps without changing templates.
+First Clawdis release after the Warelay rebrand. This is a semver-major because we dropped legacy providers/agents and moved defaults to new paths while adding a full macOS companion app.
 
-### Bug Fixes
-- **Empty result field handling:** Fixed bug where Claude CLI returning `result: ""` (empty string) would cause raw JSON to be sent to WhatsApp instead of being treated as valid empty output. Changed truthy check to explicit type check in `command-reply.ts`.
-- **Response prefix on heartbeat replies:** Fixed `responsePrefix` (e.g., `🦞`) not being applied to heartbeat alert messages. The prefix was only applied in the regular message handler, not in `runReplyHeartbeat`.
-- **User-visible error messages:** Command failures (non-zero exit, killed processes, exceptions) now return user-friendly error messages to WhatsApp instead of silently failing with empty responses.
-- **Test session isolation:** Fixed tests corrupting production `sessions.json` by mocking session persistence in all test files.
-- **Signal session corruption prevention:** Added IPC mechanism so `warelay send` and `warelay heartbeat` reuse the running relay's WhatsApp connection instead of creating new Baileys sockets. Previously, using these commands while the relay was running could corrupt the Signal session ratchet (both connections wrote to the same auth state), causing the relay's subsequent sends to fail silently.
+### Breaking
+- Renamed to **Clawdis**: defaults now live under `~/.clawdis` (sessions in `~/.clawdis/sessions/`, IPC at `~/.clawdis/clawdis.sock`, logs in `/tmp/clawdis`). Launchd labels and config filenames follow the new name; legacy stores are copied forward on first run.
+- Pi/Tau only: `inbound.reply.agent.kind` accepts only `"pi"`, and the agent CLI/CLI flags for Claude/Codex/Gemini were removed. The Pi CLI runs in RPC mode with a persistent worker.
+- WhatsApp Web is the only transport; Twilio support and related CLI flags/tests were removed.
+
+### macOS companion app
+- **Clawdis.app menu bar companion**: packaged, signed bundle with relay start/stop, launchd toggle, project-root and pnpm/node auto-resolution, live log shortcut, restart button, and status/recipient table plus badges/dimming for attention and paused states.
+- **On-device Voice Wake**: Apple speech recognizer with wake-word table, language picker, live mic meter, “hold until silence,” animated ears/legs, and an SSH forwarder + test harness that runs `clawdis-mac agent --message …` on your target machine and surfaces errors clearly.
+- **WebChat & Debugging**: bundled WebChat UI, Debug tab with heartbeat sliders, session-store picker, log opener (`clawlog`), relay restart, health probes, and scrollable settings panes.
+
+### WhatsApp & agent experience
+- Group chats fully supported: mention-gated triggers (including media-only captions), sender attribution, session primer with subject/member roster, allowlist bypass when you’re @‑mentioned, and safer handling of view-once/ephemeral media.
+- Thinking/verbosity directives: `/think` and `/verbose` acknowledge and persist per session while allowing inline overrides; verbose mode streams tool metadata with emoji/args/previews and coalesces bursts to reduce WhatsApp noise.
+- Heartbeats: configurable cadence with CLI/GUI toggles; directive acks suppressed during heartbeats; array/multi-payload replies normalized for Baileys.
+- Reply quality: smarter chunking on words/newlines, fallback warnings when media fails to send, self-number mention detection, and primed group sessions send the roster on first turn.
+
+### CLI, RPC, and health
+- New `clawdis agent` command plus a persistent Pi RPC worker (auto-started) enables direct agent chats; `clawdis status` renders a colored session/recipient table.
+- `clawdis health` probes WhatsApp link status, connect latency, heartbeat interval, session-store recency, and IPC socket presence (JSON mode for monitors).
+- Added `--help`/`--version` flags; login/logout accept `--provider` (WhatsApp default). Console output is mirrored into pino logs under `/tmp/clawdis`.
+- RPC stability: stdin/stdout loop for Tau/Pi, auto-restart worker, raw error surfacing, and deliver-via-RPC when JSON agent output is returned.
+
+### Security & hardening
+- Media server blocks symlink/path traversal, clears temporary downloads, and rotates logs daily (24h retention).
+- Session store purged on logout; IPC socket directory permissions tightened (0700/0600).
+- Launchd PATH and helper lookup hardened for packaged macOS builds; health probes surface missing binaries quickly.
+
+## 1.5.0 — 2025-12-05
+
+### Breaking
+- Dropped all non-Pi agents (Claude, Codex, Gemini, Opencode); `inbound.reply.agent.kind` now only accepts `"pi"` and related CLI helpers have been removed.
+- Removed Twilio support and all related commands/options (webhook/up/provider flags/wait-poll); CLAWDIS is Baileys Web-only.
 
 ### Changes
-- **IPC server for relay:** The web relay now starts a Unix socket server at `~/.warelay/relay.sock`. Commands like `warelay send --provider web` automatically connect via IPC when the relay is running, falling back to direct connection otherwise.
-- **Batched inbound messaging with timestamps:** When multiple WhatsApp messages queue up, they’re sent to the agent in one combined batch, each line timestamped consistently to preserve ordering and context.
-- **Typing indicator after IPC send:** After sending a message via IPC (e.g., `warelay send`), the relay now automatically shows the typing indicator ("composing") to signal that more messages may be coming.
-- **Auto-recovery from stuck WhatsApp sessions:** Added watchdog timer that detects when WhatsApp event emitter stops firing (e.g., after Bad MAC decryption errors) and automatically restarts the connection after 30 minutes of no message activity. Heartbeat logging now includes `minutesSinceLastMessage` and warns when >30 minutes without messages. The 30-minute timeout is intentionally longer than typical `heartbeatMinutes` configs to avoid false positives.
-- **Early allowFrom filtering:** Unauthorized senders are now blocked in `inbound.ts` BEFORE encryption/decryption attempts, preventing Bad MAC errors from corrupting session state. Previously, messages from unauthorized senders would trigger decryption failures that could silently kill the event emitter.
-- **Test isolation improvements:** Mock `loadConfig()` in all test files to prevent loading real user config (with emojis/prefixes) during tests. Default test config now has no prefixes/timestamps for cleaner assertions.
-- **Same-phone mode (self-messaging):** warelay now supports running on the same phone number you message from. This enables setups where you chat with yourself to control an AI assistant. Same-phone mode (`from === to`) is always allowed, even without configuring `allowFrom`. Echo detection prevents infinite loops by tracking recently sent message text and skipping auto-replies when incoming messages match.
-- **Echo detection:** The `fromMe` filter in `inbound.ts` is deliberately removed for same-phone setups; instead, text-based echo detection in `auto-reply.ts` tracks sent messages in a bounded Set (max 100 entries) and skips processing when a match is found.
-- **Same-phone detection logging:** Verbose mode now logs `📱 Same-phone mode detected` when `from === to`.
-- **Configurable same-phone marker:** New `inbound.samePhoneMarker` config option to customize the prefix added to messages in same-phone mode (default: `[same-phone]`). Set it to something cute like `[🦞 same-phone]` to help distinguish bot replies.
+- Default agent handling now favors Pi RPC while falling back to the plain command runner for non-Pi invocations, keeping heartbeat/session plumbing intact.
+- Documentation updated to reflect Pi-only support and to mark legacy Claude paths as historical.
+- Status command reports web session health + session recipients; config paths are locked to `~/.clawdis` with session metadata stored under `~/.clawdis/sessions/`.
+- Simplified send/agent/relay/heartbeat to web-only delivery; removed Twilio mocks/tests and dead code.
+- Tau RPC timeout is now inactivity-based (5m without events) and error messages show seconds only.
+- Pi/Tau sessions now write to `~/.clawdis/sessions/` by default (legacy `~/.tau/agent/sessions/clawdis` files are copied over when present).
+- Directive triggers (`/think`, `/verbose`, `/stop` et al.) now reply immediately using normalized bodies (timestamps/group prefixes stripped) without waiting for the agent.
+- Directive/system acks carry a `⚙️` prefix and verbose parsing rejects typoed `/ver*` strings so unrelated text doesn’t flip verbosity.
+- Batched history blocks no longer trip directive parsing; `/think` in prior messages won't emit stray acknowledgements.
+- RPC fallbacks no longer echo the user's prompt (e.g., pasting a link) when the agent returns no assistant text.
+- Heartbeat prompts with `/think` no longer send directive acks; heartbeat replies stay silent on settings.
+- `clawdis sessions` now renders a colored table (a la oracle) with context usage shown in k tokens and percent of the context window.
+
+## 1.4.1 — 2025-12-04
+
+### Changes
+- Added `clawdis agent` CLI command to talk directly to the configured agent using existing session handling (no WhatsApp send), with JSON output and delivery option.
+- `/new` reset trigger now works even when inbound messages have timestamp prefixes (e.g., `[Dec 4 17:35]`).
+- WhatsApp mention parsing accepts nullable arrays and flattens safely to avoid missed mentions.
+
+## 1.4.0 — 2025-12-03
+
+### Highlights
+- **Thinking directives & state:** `/t|/think|/thinking <level>` (aliases off|minimal|low|medium|high|max/highest). Inline applies to that message; directive-only message pins the level for the session; `/think:off` clears. Resolution: inline > session override > `inbound.reply.thinkingDefault` > off. Pi/Tau get `--thinking <level>` (except off); other agents append cue words (`think` → `think hard` → `think harder` → `ultrathink`). Heartbeat probe uses `HEARTBEAT /think:high`.
+- **Group chats (web provider):** Clawdis now fully supports WhatsApp groups: mention-gated triggers (including image-only @ mentions), recent group history injection, per-group sessions, sender attribution, and a first-turn primer with group subject/member roster; heartbeats are skipped for groups.
+- **Group session primer:** The first turn of a group session now tells the agent it is in a WhatsApp group and lists known members/subject so it can address the right speaker.
+- **Media failures are surfaced:** When a web auto-reply media fetch/send fails (e.g., HTTP 404), we now append a warning to the fallback text so you know the attachment was skipped.
+- **Verbose directives + session hints:** `/v|/verbose on|full|off` mirrors thinking: inline > session > config default. Directive-only replies with an acknowledgement; invalid levels return a hint. When enabled, tool results from JSON-emitting agents (Pi/Tau, etc.) are forwarded as metadata-only `[🛠️ <tool-name> <arg>]` messages (now streamed as they happen), and new sessions surface a `🧭 New session: <id>` hint.
+- **Verbose tool coalescing:** successive tool results of the same tool within ~1s are batched into one `[🛠️ tool] arg1, arg2` message to reduce WhatsApp noise.
+- **Directive confirmations:** Directive-only messages now reply with an acknowledgement (`Thinking level set to high.` / `Thinking disabled.`) and reject unknown levels with a helpful hint (state is unchanged).
+- **Pi/Tau stability:** RPC replies buffered until the assistant turn finishes; parsers return consistent `texts[]`; web auto-replies keep a warm Tau RPC process to avoid cold starts.
+- **Claude prompt flow:** One-time `sessionIntro` with per-message `/think:high` bodyPrefix; system prompt always sent on first turn even with `sendSystemOnce`.
+- **Heartbeat UX:** Backpressure skips reply heartbeats while other commands run; skips don’t refresh session `updatedAt`; web heartbeats normalize array payloads and optional `heartbeatCommand`.
+- **Control via WhatsApp:** Send `/restart` to restart the launchd service (`com.steipete.clawdis`) from your allowed numbers.
+- **Tau completion signal:** RPC now resolves on Tau’s `agent_end` (or process exit) so late assistant messages aren’t truncated; 5-minute hard cap only as a failsafe.
+
+### Reliability & UX
+- Outbound chunking prefers newlines/word boundaries and enforces caps (~4000 chars for web/WhatsApp).
+- Web auto-replies fall back to caption-only if media send fails; hosted media MIME-sniffed and cleaned up immediately.
+- IPC relay send shows typing indicator; batched inbound messages keep timestamps; watchdog restarts WhatsApp after long inactivity.
+- Early `allowFrom` filtering prevents decryption errors; same-phone mode supported with echo suppression.
+- All console output is now mirrored into pino logs (still printed to stdout/stderr), so verbose runs keep full traces.
+- `--verbose` now forces log level `trace` (was `debug`) to capture every event.
+- Verbose tool messages now include emoji + args + a short result preview for bash/read/edit/write/attach (derived from RPC tool start/end events).
+
+### Security / Hardening
+- IPC socket hardened (0700 dir / 0600 socket, no symlinks/foreign owners); `clawdis logout` also prunes session store.
+- Media server blocks symlinks and enforces path containment; logging rotates daily and prunes >24h.
+
+### Bug Fixes
+- Web group chats now bypass the second `allowFrom` check (we still enforce it on the group participant at inbox ingest), so mentioned group messages reply even when the group JID isn’t in your allowlist.
+- `logVerbose` also writes to the configured Pino logger at debug level (without breaking stdout).
+- Group auto-replies now append the triggering sender (`[from: Name (+E164)]`) to the batch body so agents can address the right person in group chats.
+- Media-only pings now pick up mentions inside captions (image/video/etc.), so @-mentions on media-only messages trigger replies.
+- MIME sniffing and redirect handling for downloads/hosted media.
+- Response prefix applied to heartbeat alerts; heartbeat array payloads handled for both providers.
+- Tau RPC typing exposes `signal`/`killed`; NDJSON parsers normalized across agents.
+- Tau (pi) session resumes now append `--continue`, so existing history/think level are reloaded instead of starting empty.
+
+### Testing
+- Fixtures isolate session stores; added coverage for thinking directives, stateful levels, heartbeat backpressure, and agent parsing.
+
+## 1.3.0 — 2025-12-02
+
+### Highlights
+- **Pluggable agents (Claude, Pi, Codex, Opencode):** `inbound.reply.agent` selects CLI/parser; per-agent argv builders and NDJSON parsers enable swapping without template changes.
+- **Safety stop words:** `stop|esc|abort|wait|exit` immediately reply “Agent was aborted.” and mark the session so the next prompt is prefixed with an abort reminder.
+- **Agent session reliability:** Only Claude returns a stable `session_id`; others may reset between runs.
+
+### Bug Fixes
+- Empty `result` fields no longer leak raw JSON to users.
+- Heartbeat alerts now honor `responsePrefix`.
+- Command failures return user-friendly messages.
+- Test session isolation to avoid touching real `sessions.json`.
+- IPC reuse for `clawdis send/heartbeat` prevents Signal/WhatsApp session corruption.
+- Web send respects media kind (image/audio/video/document) with correct limits.
+
+### Changes
+- IPC relay socket at `~/.clawdis/relay.sock` with automatic CLI fallback.
+- Batched inbound messages with timestamps; typing indicator after IPC sends.
+- Watchdog restarts WhatsApp after long inactivity; heartbeat logging includes minutes since last message.
+- Early `allowFrom` filtering before decryption.
+- Same-phone mode with echo detection and optional `inbound.samePhoneMarker`.
 
 ## 1.2.2 — 2025-11-28
 
 ### Changes
-- **Manual heartbeat sends:** `warelay heartbeat` accepts `--message/--body` with `--provider web|twilio` to push real outbound messages through the same plumbing; `--dry-run` previews payloads without sending.
-
-## Unreleased
-
-### Changes
-- **Heartbeat backpressure:** Web reply heartbeats now check the shared command queue and skip while any command/Claude runs are in flight, preventing concurrent prompts during long-running requests.
-- **Isolated session fixtures in web tests:** Heartbeat/auto-reply tests now create temporary session stores instead of using the default `~/.warelay/sessions.json`, preventing local config pollution during test runs.
+- Manual heartbeat sends: `clawdis heartbeat --message/--body` (web provider only); `--dry-run` previews payloads.
 
 ## 1.2.1 — 2025-11-28
 
 ### Changes
-- **Media MIME-first handling:** Media loading now sniffs magic bytes/header before trusting extensions for both providers; local files with the wrong suffix still get correct MIME and image recompression.
-- **Hosted media extensions:** Saved/hosted media (web inbound, webhook hosting, Twilio hosting) now writes files with an extension derived from detected MIME (e.g., `.jpg`, `.png`, `.mp4`), so downstream CLI sends carry the right Content-Type. Added tests covering inbound Baileys downloads and buffer saves.
+- Media MIME-first handling; hosted media extensions derived from detected MIME with tests.
 
-### Planned / in progress
-- **Heartbeat targeting quality:** Allow `warelay heartbeat --provider web --all` to fall back to `inbound.allowFrom` when no sessions exist, and surface a clear error when neither sessions nor allow-list entries are present. Add verbose log lines that state exactly which recipients were chosen and why.
-- **Heartbeat delivery preview (Claude path):** Add a dry-run mode that resolves the heartbeat reply (text/media) and prints it without sending, to help test Claude prompt changes safely.
-- **Simulated inbound hook (debug):** Optional local-only endpoint to inject synthetic inbound messages into the web relay loop, sharing the same command queue and reply path. Useful for testing auto-replies and heartbeats without WhatsApp.
+### Planned / in progress (from prior notes)
+- Heartbeat targeting quality: clearer recipient resolution and verbose logs.
+- Heartbeat delivery preview (Claude path) dry-run.
+- Simulated inbound hook for local testing.
 
 ## 1.2.0 — 2025-11-27
 
 ### Changes
-- **Heartbeat UX:** Default heartbeat interval is now 10 minutes for command mode. Heartbeat prompt is `HEARTBEAT ultrathink`; replies of exactly `HEARTBEAT_OK` suppress outbound messages but still log. Fallback heartbeats no longer start fresh sessions when none exist, and skipped heartbeats do not refresh session `updatedAt` (so idle expiry still works). Session-level `heartbeatIdleMinutes` is supported.
-- **Heartbeat tooling:** `warelay heartbeat` accepts `--session-id` to force resume a specific Claude session. Added `--heartbeat-now` to relay startup, plus helper scripts `warelay relay:heartbeat` and `warelay relay:heartbeat:tmux` to fire a heartbeat immediately when the relay launches.
-- **Prompt structure for Claude:** Introduced one-time `sessionIntro` (system prompt) with per-message `bodyPrefix` of `ultrathink`, so the full prompt is sent only on the first turn; later turns only prepend `ultrathink`. Session idle extended to 7 days (configurable).
-- **Robustness:** Added WebSocket error guards for Baileys sessions; global `unhandledRejection`/`uncaughtException` handlers log and exit cleanly. Web inbound now resolves WhatsApp Linked IDs (`@lid`) using Baileys reverse mapping. Media hosting during Twilio webhooks uses the shared host module and is covered by tests.
-- **Docs:** README now highlights the Clawd setup with links, and `docs/claude-config.md` contains the live personal config (home folder, prompts, heartbeat behavior, and session settings).
+- Heartbeat interval default 10m for command mode; prompt `HEARTBEAT /think:high`; skips don’t refresh session; session `heartbeatIdleMinutes` support.
+- Heartbeat tooling: `--session-id`, `--heartbeat-now`, relay helpers `relay:heartbeat` and `relay:heartbeat:tmux`.
+- Prompt structure: `sessionIntro` plus per-message `/think:high`; session idle up to 7 days.
+- Thinking directives: `/think:<level>`; Pi uses `--thinking`; others append cue; `/think:off` no-op.
+- Robustness: Baileys/WebSocket guards; global unhandled error handlers; WhatsApp LID mapping; hosted media MIME-sniffing and cleanup.
+- Docs: README Clawd setup; `docs/claude-config.md` for live config.
 
 ## 1.1.0 — 2025-11-26
 
 ### Changes
-- Web auto-replies now resize/recompress media and honor `inbound.reply.mediaMaxMb` in `~/.warelay/warelay.json` (default 5 MB) to avoid provider/API limits.
-- Web provider now detects media kind (image/audio/video/document), logs the source path, and enforces provider caps: images ≤6 MB, audio/video ≤16 MB, documents ≤100 MB; images still target the configurable cap above with resize + JPEG recompress.
-- Sessions can now send the system prompt only once: set `inbound.reply.session.sendSystemOnce` (optional `sessionIntro` for the first turn) to avoid re-sending large prompts every message.
-- While commands run, typing indicators refresh every 30s by default (tune with `inbound.reply.typingIntervalSeconds`); helps keep WhatsApp “composing” visible during longer Claude runs.
-- Optional voice-note transcription: set `inbound.transcribeAudio.command` (e.g., OpenAI Whisper CLI) to turn inbound audio into text before templating/Claude; verbose logs surface when transcription runs. Prompts now include the original media path plus a `Transcript:` block so models see both.
-- Auto-reply command replies now return structured `{ payload, meta }`, respect `mediaMaxMb` for local media, log Claude metadata, and include the command `cwd` in timeout messages for easier debugging.
-- Added unit coverage for command helper edge cases (Claude flags, session args, media tokens, timeouts) and transcription download/command invocation.
-- Split the monolithic web provider into focused modules under `src/web/` plus a barrel; added logout command, no-fallback relay behavior, and web-only relay start helper.
-- Introduced structured reconnect/heartbeat logging (`web-reconnect`, `web-heartbeat`), bounded exponential backoff with CLI and config knobs, and a troubleshooting guide at `docs/refactor/web-relay-troubleshooting.md`.
-- Relay help now prints effective heartbeat/backoff settings when running in web mode for quick triage.
+- Web auto-replies resize/recompress media and honor `inbound.reply.mediaMaxMb`.
+- Detect media kind, enforce provider caps (images ≤6MB, audio/video ≤16MB, docs ≤100MB).
+- `session.sendSystemOnce` and optional `sessionIntro`.
+- Typing indicator refresh during commands; configurable via `inbound.reply.typingIntervalSeconds`.
+- Optional audio transcription via external CLI.
+- Command replies return structured payload/meta; respect `mediaMaxMb`; log Claude metadata; include `cwd` in timeout messages.
+- Web provider refactor; logout command; web-only relay start helper.
+- Structured reconnect/heartbeat logging; bounded backoff with CLI/config knobs; troubleshooting guide.
+- Relay help prints effective heartbeat/backoff when in web mode.
 
 ## 1.0.4 — 2025-11-25
 
 ### Changes
-- Auto-replies now send a WhatsApp fallback message when a command/Claude run hits the timeout, including up to 800 chars of partial stdout so the user still sees progress.
-- Added tests covering the new timeout fallback behavior and partial-output truncation.
-- Web relay auto-reconnects after Baileys/WebSocket drops (with log-out detection) and exposes close events for monitoring; added tests for close propagation and reconnect loop.
+- Timeout fallbacks send partial stdout (≤800 chars) to the user instead of silence; tests added.
+- Web relay auto-reconnects after Baileys/WebSocket drops; close propagation tests.
 
 ## 0.1.3 — 2025-11-25
 
-### Features
-- Added `cwd` option to command reply config for setting the working directory where commands execute. Essential for Claude Code to have proper project context.
-- Added configurable file-based logging (default `/tmp/warelay/warelay.log`) with log level set via `logging.level` in `~/.warelay/warelay.json`; verbose still forces debug.
-
-### Developer notes
-- Command auto-replies now pass `{ timeoutMs, cwd }` into the command runner; custom runners/tests that stub `runCommandWithTimeout` should accept the options object as well as the legacy numeric timeout.
-
-## 0.1.2 — 2025-11-25
-
-### CI/build fix
-- Fixed commander help configuration (`subcommandTerm`) so TypeScript builds pass in CI.
-
-## 0.1.1 — 2025-11-25
-
-### CLI polish
-- Added a proper executable shim so `npx warelay@0.1.x --help` runs the CLI directly.
-- Help/version banner now uses the README tagline with color, and the help footer includes colored examples with short explanations.
-- `send` and `status` gained a `--verbose` flag for consistent noisy output when debugging.
-- Lowercased branding in docs/UA; web provider UA is `warelay/cli/0.1.1`.
-
-
-## 0.1.0 — 2025-11-25
-
-### CLI & Providers
-- Bundles a single `warelay` CLI with commands for `send`, `relay`, `status`, `webhook`, `login`, and tmux helpers `relay:tmux` / `relay:tmux:attach` (see `src/cli/program.ts`); `webhook` accepts `--ingress tailscale|none`.
-- Supports two messaging backends: **Twilio** (default) and **personal WhatsApp Web**; `relay --provider auto` selects Web when a cached login exists, otherwise falls back to Twilio polling (`provider-web.ts`, `cli/program.ts`).
-- `send` can target either provider, optionally wait for delivery status (Twilio only), output JSON, dry-run payloads, and attach media (`commands/send.ts`).
-- `status` merges inbound + outbound Twilio traffic with formatted lines or JSON output (`commands/status.ts`, `twilio/messages.ts`).
-
-### Webhook, Funnel & Port Management
-- `webhook` starts an Express server for inbound Twilio callbacks, logs requests, and optionally auto-replies with static text or config-driven replies (`twilio/webhook.ts`, `commands/webhook.ts`).
-- `webhook --ingress tailscale` automates end-to-end webhook setup: ensures required binaries, enables Tailscale Funnel, starts the webhook on the chosen port/path, discovers the WhatsApp sender SID, and updates Twilio webhook URLs with multiple fallbacks (`commands/up.ts`, `infra/tailscale.ts`, `twilio/update-webhook.ts`, `twilio/senders.ts`).
-- Guardrails detect busy ports with helpful diagnostics and aborts when conflicts are found (`infra/ports.ts`).
-
-### Auto-Reply Engine
-- Configurable via `~/.warelay/warelay.json` (JSON5) with allowlist support, text or command-driven replies, templating (`{{Body}}`, `{{From}}`, `{{MediaPath}}`, etc.), optional body prefixes, and per-sender or global conversation sessions with `/new` resets and idle expiry (`auto-reply/reply.ts`, `config/config.ts`, `config/sessions.ts`, `auto-reply/templating.ts`).
-- Command replies run through a process-wide FIFO queue to avoid concurrent executions across webhook, poller, and web listener flows (`process/command-queue.ts`); verbose mode surfaces wait times.
-- Claude CLI integration auto-injects identity, output-format flags, session args, and parses JSON output while preserving metadata (`auto-reply/claude.ts`, `auto-reply/reply.ts`).
-- Typing indicators fire before replies for Twilio, and Web provider sends “composing/available” presence when possible (`twilio/typing.ts`, `provider-web.ts`).
-
-### Media Pipeline
-- `send --media` works on both providers: Web accepts local paths or URLs; Twilio requires HTTPS and transparently hosts local files (≤5 MB) via the Funnel/webhook media endpoint, auto-spawning a short-lived media server when `--serve-media` is requested (`commands/send.ts`, `media/host.ts`, `media/server.ts`).
-- Auto-replies may include `mediaUrl` from config or command output (`MEDIA:` token extraction) and will host local media when needed before sending (`auto-reply/reply.ts`, `media/parse.ts`, `media/host.ts`).
-- Inbound media from Twilio or Web is downloaded to `~/.warelay/media` with TTL cleanup and passed to commands via `MediaPath`/`MediaType` for richer prompts (`twilio/webhook.ts`, `provider-web.ts`, `media/store.ts`).
-
-### Relay & Monitoring
-- `relay` polls Twilio on an interval with exponential-backoff resilience, auto-replying to inbound messages, or listens live via WhatsApp Web with automatic read receipts and presence updates (`cli/program.ts`, `twilio/monitor.ts`, `provider-web.ts`).
-- `send` + `waitForFinalStatus` polls Twilio until a terminal delivery state (delivered/read) or timeout, with clear failure surfaces (`twilio/send.ts`).
-
-### Developer & Ops Ergonomics
-- `relay:tmux` helper restarts/attaches to a dedicated `warelay-relay` tmux session for long-running relays (`cli/relay_tmux.ts`).
-- Environment validation enforces Twilio credentials early and supports either auth token or API key/secret pairs (`env.ts`).
-- Shared logging utilities, binary checks, and runtime abstractions keep CLI output consistent (`globals.ts`, `logger.ts`, `infra/binaries.ts`).
+### Changes
+- Auto-replies send a WhatsApp fallback message on command/Claude timeout with truncated stdout.
+- Added tests for timeout fallback and partial-output truncation.

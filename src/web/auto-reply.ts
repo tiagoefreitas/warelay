@@ -1,20 +1,21 @@
+import { chunkText } from "../auto-reply/chunk.js";
 import { getReplyFromConfig } from "../auto-reply/reply.js";
 import type { ReplyPayload } from "../auto-reply/types.js";
 import { waitForever } from "../cli/wait.js";
 import { loadConfig } from "../config/config.js";
 import {
   DEFAULT_IDLE_MINUTES,
-  deriveSessionKey,
   loadSessionStore,
+  resolveSessionKey,
   resolveStorePath,
   saveSessionStore,
 } from "../config/sessions.js";
 import { danger, info, isVerbose, logVerbose, success } from "../globals.js";
 import { logInfo } from "../logger.js";
 import { getChildLogger } from "../logging.js";
-import { enqueueCommand, getQueueSize } from "../process/command-queue.js";
+import { getQueueSize } from "../process/command-queue.js";
 import { defaultRuntime, type RuntimeEnv } from "../runtime.js";
-import { normalizeE164 } from "../utils.js";
+import { jidToE164, normalizeE164 } from "../utils.js";
 import { monitorWebInbox } from "./inbound.js";
 import { sendViaIpc, startIpcServer, stopIpcServer } from "./ipc.js";
 import { loadWebMedia } from "./media.js";
@@ -28,6 +29,14 @@ import {
   sleepWithAbort,
 } from "./reconnect.js";
 import { getWebAuthAgeMs } from "./session.js";
+
+const WEB_TEXT_LIMIT = 4000;
+const DEFAULT_GROUP_HISTORY_LIMIT = 50;
+
+let heartbeatsEnabled = true;
+export function setHeartbeatsEnabled(enabled: boolean) {
+  heartbeatsEnabled = enabled;
+}
 
 /**
  * Send a message via IPC if relay is running, otherwise fall back to direct.
@@ -69,7 +78,91 @@ const formatDuration = (ms: number) =>
 
 const DEFAULT_REPLY_HEARTBEAT_MINUTES = 30;
 export const HEARTBEAT_TOKEN = "HEARTBEAT_OK";
-export const HEARTBEAT_PROMPT = "HEARTBEAT ultrathink";
+export const HEARTBEAT_PROMPT = "HEARTBEAT /think:high";
+
+function elide(text?: string, limit = 400) {
+  if (!text) return text;
+  if (text.length <= limit) return text;
+  return `${text.slice(0, limit)}… (truncated ${text.length - limit} chars)`;
+}
+
+type MentionConfig = {
+  requireMention: boolean;
+  mentionRegexes: RegExp[];
+};
+
+function buildMentionConfig(cfg: ReturnType<typeof loadConfig>): MentionConfig {
+  const gc = cfg.inbound?.groupChat;
+  const requireMention = gc?.requireMention !== false; // default true
+  const mentionRegexes =
+    gc?.mentionPatterns
+      ?.map((p) => {
+        try {
+          return new RegExp(p, "i");
+        } catch {
+          return null;
+        }
+      })
+      .filter((r): r is RegExp => Boolean(r)) ?? [];
+  return { requireMention, mentionRegexes };
+}
+
+function isBotMentioned(
+  msg: WebInboundMsg,
+  mentionCfg: MentionConfig,
+): boolean {
+  const clean = (text: string) =>
+    text
+      // Remove zero-width and directionality markers WhatsApp injects around display names
+      .replace(/[\u200b-\u200f\u202a-\u202e\u2060-\u206f]/g, "")
+      .toLowerCase();
+
+  if (msg.mentionedJids?.length) {
+    const normalizedMentions = msg.mentionedJids
+      .map((jid) => jidToE164(jid) ?? jid)
+      .filter(Boolean);
+    if (msg.selfE164 && normalizedMentions.includes(msg.selfE164)) return true;
+    if (msg.selfJid && msg.selfE164) {
+      // Some mentions use the bare JID; match on E.164 to be safe.
+      const bareSelf = msg.selfJid.replace(/:\\d+/, "");
+      if (normalizedMentions.includes(bareSelf)) return true;
+    }
+  }
+  const bodyClean = clean(msg.body);
+  if (mentionCfg.mentionRegexes.some((re) => re.test(bodyClean))) return true;
+
+  // Fallback: detect body containing our own number (with or without +, spacing)
+  if (msg.selfE164) {
+    const selfDigits = msg.selfE164.replace(/\D/g, "");
+    if (selfDigits) {
+      const bodyDigits = bodyClean.replace(/[^\d]/g, "");
+      if (bodyDigits.includes(selfDigits)) return true;
+      const bodyNoSpace = msg.body.replace(/[\s-]/g, "");
+      const pattern = new RegExp(`\\+?${selfDigits}`, "i");
+      if (pattern.test(bodyNoSpace)) return true;
+    }
+  }
+
+  return false;
+}
+
+function debugMention(
+  msg: WebInboundMsg,
+  mentionCfg: MentionConfig,
+): { wasMentioned: boolean; details: Record<string, unknown> } {
+  const result = isBotMentioned(msg, mentionCfg);
+  const details = {
+    from: msg.from,
+    body: msg.body,
+    bodyClean: msg.body
+      .replace(/[\u200b-\u200f\u202a-\u202e\u2060-\u206f]/g, "")
+      .toLowerCase(),
+    mentionedJids: msg.mentionedJids ?? null,
+    selfJid: msg.selfJid ?? null,
+    selfE164: msg.selfE164 ?? null,
+  };
+  return { wasMentioned: result, details };
+}
 
 export function resolveReplyHeartbeatMinutes(
   cfg: ReturnType<typeof loadConfig>,
@@ -125,11 +218,15 @@ export async function runWebHeartbeatOnce(opts: {
   });
 
   const cfg = cfgOverride ?? loadConfig();
+  const sessionCfg = cfg.inbound?.reply?.session;
+  const sessionScope = sessionCfg?.scope ?? "per-sender";
+  const mainKey = sessionCfg?.mainKey;
+  const sessionKey = resolveSessionKey(sessionScope, { From: to }, mainKey);
   if (sessionId) {
     const storePath = resolveStorePath(cfg.inbound?.reply?.session?.store);
     const store = loadSessionStore(storePath);
-    store[to] = {
-      ...(store[to] ?? {}),
+    store[sessionKey] = {
+      ...(store[sessionKey] ?? {}),
       sessionId,
       updatedAt: Date.now(),
     };
@@ -188,14 +285,18 @@ export async function runWebHeartbeatOnce(opts: {
         To: to,
         MessageSid: sessionId ?? sessionSnapshot.entry?.sessionId,
       },
-      undefined,
+      { isHeartbeat: true },
       cfg,
     );
+    const replyPayload = Array.isArray(replyResult)
+      ? replyResult[0]
+      : replyResult;
+
     if (
-      !replyResult ||
-      (!replyResult.text &&
-        !replyResult.mediaUrl &&
-        !replyResult.mediaUrls?.length)
+      !replyPayload ||
+      (!replyPayload.text &&
+        !replyPayload.mediaUrl &&
+        !replyPayload.mediaUrls?.length)
     ) {
       heartbeatLogger.info(
         {
@@ -210,13 +311,12 @@ export async function runWebHeartbeatOnce(opts: {
     }
 
     const hasMedia = Boolean(
-      replyResult.mediaUrl || (replyResult.mediaUrls?.length ?? 0) > 0,
+      replyPayload.mediaUrl || (replyPayload.mediaUrls?.length ?? 0) > 0,
     );
-    const stripped = stripHeartbeatToken(replyResult.text);
+    const stripped = stripHeartbeatToken(replyPayload.text);
     if (stripped.shouldSkip && !hasMedia) {
       // Don't let heartbeats keep sessions alive: restore previous updatedAt so idle expiry still works.
-      const sessionCfg = cfg.inbound?.reply?.session;
-      const storePath = resolveStorePath(sessionCfg?.store);
+      const storePath = resolveStorePath(cfg.inbound?.reply?.session?.store);
       const store = loadSessionStore(storePath);
       if (sessionSnapshot.entry && store[sessionSnapshot.key]) {
         store[sessionSnapshot.key].updatedAt = sessionSnapshot.entry.updatedAt;
@@ -224,7 +324,7 @@ export async function runWebHeartbeatOnce(opts: {
       }
 
       heartbeatLogger.info(
-        { to, reason: "heartbeat-token", rawLength: replyResult.text?.length },
+        { to, reason: "heartbeat-token", rawLength: replyPayload.text?.length },
         "heartbeat skipped",
       );
       console.log(success("heartbeat: ok (HEARTBEAT_OK)"));
@@ -238,7 +338,7 @@ export async function runWebHeartbeatOnce(opts: {
       );
     }
 
-    const finalText = stripped.text || replyResult.text || "";
+    const finalText = stripped.text || replyPayload.text || "";
     if (dryRun) {
       heartbeatLogger.info(
         { to, reason: "dry-run", chars: finalText.length },
@@ -252,7 +352,12 @@ export async function runWebHeartbeatOnce(opts: {
 
     const sendResult = await sender(to, finalText, { verbose });
     heartbeatLogger.info(
-      { to, messageId: sendResult.messageId, chars: finalText.length },
+      {
+        to,
+        messageId: sendResult.messageId,
+        chars: finalText.length,
+        preview: elide(finalText, 140),
+      },
       "heartbeat sent",
     );
     console.log(success(`heartbeat: alert sent to ${to}`));
@@ -264,8 +369,7 @@ export async function runWebHeartbeatOnce(opts: {
 }
 
 function getFallbackRecipient(cfg: ReturnType<typeof loadConfig>) {
-  const sessionCfg = cfg.inbound?.reply?.session;
-  const storePath = resolveStorePath(sessionCfg?.store);
+  const storePath = resolveStorePath(cfg.inbound?.reply?.session?.store);
   const store = loadSessionStore(storePath);
   const candidates = Object.entries(store).filter(([key]) => key !== "global");
   if (candidates.length === 0) {
@@ -286,7 +390,7 @@ function getSessionRecipients(cfg: ReturnType<typeof loadConfig>) {
   const sessionCfg = cfg.inbound?.reply?.session;
   const scope = sessionCfg?.scope ?? "per-sender";
   if (scope === "global") return [];
-  const storePath = resolveStorePath(sessionCfg?.store);
+  const storePath = resolveStorePath(cfg.inbound?.reply?.session?.store);
   const store = loadSessionStore(storePath);
   return Object.entries(store)
     .filter(([key]) => key !== "global" && key !== "unknown")
@@ -337,7 +441,11 @@ function getSessionSnapshot(
 ) {
   const sessionCfg = cfg.inbound?.reply?.session;
   const scope = sessionCfg?.scope ?? "per-sender";
-  const key = deriveSessionKey(scope, { From: from, To: "", Body: "" });
+  const key = resolveSessionKey(
+    scope,
+    { From: from, To: "", Body: "" },
+    sessionCfg?.mainKey,
+  );
   const store = loadSessionStore(resolveStorePath(sessionCfg?.store));
   const entry = store[key];
   const idleMinutes = Math.max(
@@ -371,14 +479,18 @@ async function deliverWebReply(params: {
     skipLog,
   } = params;
   const replyStarted = Date.now();
+  const textChunks = chunkText(replyResult.text || "", WEB_TEXT_LIMIT);
   const mediaList = replyResult.mediaUrls?.length
     ? replyResult.mediaUrls
     : replyResult.mediaUrl
       ? [replyResult.mediaUrl]
       : [];
 
-  if (mediaList.length === 0 && replyResult.text) {
-    await msg.reply(replyResult.text || "");
+  // Text-only replies
+  if (mediaList.length === 0 && textChunks.length) {
+    for (const chunk of textChunks) {
+      await msg.reply(chunk);
+    }
     if (!skipLog) {
       logInfo(
         `✅ Sent web reply to ${msg.from} (${(Date.now() - replyStarted).toFixed(0)}ms)`,
@@ -391,7 +503,7 @@ async function deliverWebReply(params: {
         connectionId: connectionId ?? null,
         to: msg.from,
         from: msg.to,
-        text: replyResult.text,
+        text: elide(replyResult.text, 240),
         mediaUrl: null,
         mediaSizeBytes: null,
         mediaKind: null,
@@ -402,8 +514,12 @@ async function deliverWebReply(params: {
     return;
   }
 
-  const cleanText = replyResult.text ?? undefined;
+  const remainingText = [...textChunks];
+
+  // Media (with optional caption on first item)
   for (const [index, mediaUrl] of mediaList.entries()) {
+    const caption =
+      index === 0 ? remainingText.shift() || undefined : undefined;
     try {
       const media = await loadWebMedia(mediaUrl, maxMediaBytes);
       if (isVerbose()) {
@@ -414,7 +530,6 @@ async function deliverWebReply(params: {
           `Web auto-reply media source: ${mediaUrl} (kind ${media.kind})`,
         );
       }
-      const caption = index === 0 ? cleanText || undefined : undefined;
       if (media.kind === "image") {
         await msg.sendMedia({
           image: media.buffer,
@@ -454,7 +569,7 @@ async function deliverWebReply(params: {
           connectionId: connectionId ?? null,
           to: msg.from,
           from: msg.to,
-          text: index === 0 ? (cleanText ?? null) : null,
+          text: caption ?? null,
           mediaUrl,
           mediaSizeBytes: media.buffer.length,
           mediaKind: media.kind,
@@ -466,11 +581,28 @@ async function deliverWebReply(params: {
       console.error(
         danger(`Failed sending web media to ${msg.from}: ${String(err)}`),
       );
-      if (index === 0 && cleanText) {
-        console.log(`⚠️  Media skipped; sent text-only to ${msg.from}`);
-        await msg.reply(cleanText || "");
+      replyLogger.warn({ err, mediaUrl }, "failed to send web media reply");
+      if (index === 0) {
+        const warning =
+          err instanceof Error
+            ? `⚠️ Media failed: ${err.message}`
+            : "⚠️ Media failed.";
+        const fallbackTextParts = [
+          remainingText.shift() ?? caption ?? "",
+          warning,
+        ].filter(Boolean);
+        const fallbackText = fallbackTextParts.join("\n");
+        if (fallbackText) {
+          console.log(`⚠️  Media skipped; sent text-only to ${msg.from}`);
+          await msg.reply(fallbackText);
+        }
       }
     }
+  }
+
+  // Remaining text chunks after media
+  for (const chunk of remainingText) {
+    await msg.reply(chunk);
   }
 }
 
@@ -502,6 +634,13 @@ export async function monitorWebProvider(
     tuning.replyHeartbeatMinutes,
   );
   const reconnectPolicy = resolveReconnectPolicy(cfg, tuning.reconnect);
+  const mentionConfig = buildMentionConfig(cfg);
+  const groupHistoryLimit =
+    cfg.inbound?.groupChat?.historyLimit ?? DEFAULT_GROUP_HISTORY_LIMIT;
+  const groupHistories = new Map<
+    string,
+    Array<{ sender: string; body: string; timestamp?: number }>
+  >();
   const sleep =
     tuning.sleep ??
     ((ms: number, signal?: AbortSignal) =>
@@ -551,8 +690,7 @@ export async function monitorWebProvider(
     const MESSAGE_TIMEOUT_MS = 30 * 60 * 1000; // 30 minutes without any messages
     const WATCHDOG_CHECK_MS = 60 * 1000; // Check every minute
 
-    // Batch inbound messages while command queue is busy, then send one
-    // combined prompt with per-message timestamps (inbound-only behavior).
+    // Batch inbound messages per conversation while command queue is busy.
     type PendingBatch = { messages: WebInboundMsg[]; timer?: NodeJS.Timeout };
     const pendingBatches = new Map<string, PendingBatch>();
 
@@ -574,25 +712,51 @@ export async function monitorWebProvider(
       let messagePrefix = cfg.inbound?.messagePrefix;
       if (messagePrefix === undefined) {
         const hasAllowFrom = (cfg.inbound?.allowFrom?.length ?? 0) > 0;
-        messagePrefix = hasAllowFrom ? "" : "[warelay]";
+        messagePrefix = hasAllowFrom ? "" : "[clawdis]";
       }
       const prefixStr = messagePrefix ? `${messagePrefix} ` : "";
-      return `${formatTimestamp(msg.timestamp)}${prefixStr}${msg.body}`;
+      const senderLabel =
+        msg.chatType === "group"
+          ? `${msg.senderName ?? msg.senderE164 ?? "Someone"}: `
+          : "";
+      return `${formatTimestamp(msg.timestamp)}${prefixStr}${senderLabel}${msg.body}`;
     };
 
-    const processBatch = async (from: string) => {
-      const batch = pendingBatches.get(from);
+    const processBatch = async (conversationId: string) => {
+      const batch = pendingBatches.get(conversationId);
       if (!batch || batch.messages.length === 0) return;
       if (getQueueSize() > 0) {
-        // Wait until command queue is free to run the combined prompt.
-        batch.timer = setTimeout(() => void processBatch(from), 150);
+        batch.timer = setTimeout(() => void processBatch(conversationId), 150);
         return;
       }
-      pendingBatches.delete(from);
+      pendingBatches.delete(conversationId);
 
       const messages = batch.messages;
       const latest = messages[messages.length - 1];
-      const combinedBody = messages.map(buildLine).join("\n");
+      let combinedBody = messages.map(buildLine).join("\n");
+
+      if (latest.chatType === "group") {
+        const history = groupHistories.get(conversationId) ?? [];
+        const historyWithoutCurrent =
+          history.length > 0 ? history.slice(0, -1) : [];
+        if (historyWithoutCurrent.length > 0) {
+          const historyText = historyWithoutCurrent
+            .map(
+              (m) =>
+                `${m.sender}: ${m.body}${m.timestamp ? ` [${new Date(m.timestamp).toISOString()}]` : ""}`,
+            )
+            .join("\\n");
+          combinedBody = `[Chat messages since your last reply - for context]\\n${historyText}\\n\\n[Current message - respond to this]\\n${buildLine(latest)}`;
+        }
+        // Always surface who sent the triggering message so the agent can address them.
+        const senderLabel =
+          latest.senderName && latest.senderE164
+            ? `${latest.senderName} (${latest.senderE164})`
+            : (latest.senderName ?? latest.senderE164 ?? "Unknown");
+        combinedBody = `${combinedBody}\\n[from: ${senderLabel}]`;
+        // Clear stored history after using it
+        groupHistories.set(conversationId, []);
+      }
 
       // Echo detection uses combined body so we don't respond twice.
       if (recentlySent.has(combinedBody)) {
@@ -606,9 +770,9 @@ export async function monitorWebProvider(
         {
           connectionId,
           correlationId,
-          from,
+          from: latest.chatType === "group" ? conversationId : latest.from,
           to: latest.to,
-          body: combinedBody,
+          body: elide(combinedBody, 240),
           mediaType: latest.mediaType ?? null,
           mediaPath: latest.mediaPath ?? null,
           batchSize: messages.length,
@@ -619,100 +783,141 @@ export async function monitorWebProvider(
       const tsDisplay = latest.timestamp
         ? new Date(latest.timestamp).toISOString()
         : new Date().toISOString();
-      console.log(`\n[${tsDisplay}] ${from} -> ${latest.to}: ${combinedBody}`);
-
-      const replyResult = await enqueueCommand(() =>
-        (replyResolver ?? getReplyFromConfig)(
-          {
-            Body: combinedBody,
-            From: latest.from,
-            To: latest.to,
-            MessageSid: latest.id,
-            MediaPath: latest.mediaPath,
-            MediaUrl: latest.mediaUrl,
-            MediaType: latest.mediaType,
-          },
-          {
-            onReplyStart: latest.sendComposing,
-          },
-        ),
+      const fromDisplay =
+        latest.chatType === "group" ? conversationId : latest.from;
+      console.log(
+        `\n[${tsDisplay}] ${fromDisplay} -> ${latest.to}: ${combinedBody}`,
       );
 
-      if (
-        !replyResult ||
-        (!replyResult.text &&
-          !replyResult.mediaUrl &&
-          !replyResult.mediaUrls?.length)
-      ) {
+      const replyResult = await (replyResolver ?? getReplyFromConfig)(
+        {
+          Body: combinedBody,
+          From: latest.from,
+          To: latest.to,
+          MessageSid: latest.id,
+          MediaPath: latest.mediaPath,
+          MediaUrl: latest.mediaUrl,
+          MediaType: latest.mediaType,
+          ChatType: latest.chatType,
+          GroupSubject: latest.groupSubject,
+          GroupMembers: latest.groupParticipants?.join(", "),
+          SenderName: latest.senderName,
+          SenderE164: latest.senderE164,
+          Surface: "whatsapp",
+        },
+        {
+          onReplyStart: latest.sendComposing,
+          onPartialReply: async (partial) => {
+            try {
+              await deliverWebReply({
+                replyResult: partial,
+                msg: latest,
+                maxMediaBytes,
+                replyLogger,
+                runtime,
+                connectionId,
+              });
+              if (partial.text) {
+                recentlySent.add(partial.text);
+                if (recentlySent.size > MAX_RECENT_MESSAGES) {
+                  const firstKey = recentlySent.values().next().value;
+                  if (firstKey) recentlySent.delete(firstKey);
+                }
+              }
+            } catch (err) {
+              console.error(
+                danger(
+                  `Failed sending partial web auto-reply to ${latest.from ?? conversationId}: ${String(err)}`,
+                ),
+              );
+            }
+          },
+        },
+      );
+
+      const replyList = replyResult
+        ? Array.isArray(replyResult)
+          ? replyResult
+          : [replyResult]
+        : [];
+
+      if (replyList.length === 0) {
         logVerbose("Skipping auto-reply: no text/media returned from resolver");
         return;
       }
 
       // Apply response prefix if configured (skip for HEARTBEAT_OK to preserve exact match)
       const responsePrefix = cfg.inbound?.responsePrefix;
-      if (
-        responsePrefix &&
-        replyResult.text &&
-        replyResult.text.trim() !== HEARTBEAT_TOKEN
-      ) {
-        if (!replyResult.text.startsWith(responsePrefix)) {
-          replyResult.text = `${responsePrefix} ${replyResult.text}`;
+
+      for (const replyPayload of replyList) {
+        if (
+          responsePrefix &&
+          replyPayload.text &&
+          replyPayload.text.trim() !== HEARTBEAT_TOKEN &&
+          !replyPayload.text.startsWith(responsePrefix)
+        ) {
+          replyPayload.text = `${responsePrefix} ${replyPayload.text}`;
         }
-      }
 
-      try {
-        await deliverWebReply({
-          replyResult,
-          msg: latest,
-          maxMediaBytes,
-          replyLogger,
-          runtime,
-          connectionId,
-        });
+        try {
+          await deliverWebReply({
+            replyResult: replyPayload,
+            msg: latest,
+            maxMediaBytes,
+            replyLogger,
+            runtime,
+            connectionId,
+          });
 
-        if (replyResult.text) {
-          recentlySent.add(replyResult.text);
-          recentlySent.add(combinedBody); // Prevent echo on the batch text itself
-          logVerbose(
-            `Added to echo detection set (size now: ${recentlySent.size}): ${replyResult.text.substring(0, 50)}...`,
-          );
-          if (recentlySent.size > MAX_RECENT_MESSAGES) {
-            const firstKey = recentlySent.values().next().value;
-            if (firstKey) recentlySent.delete(firstKey);
+          if (replyPayload.text) {
+            recentlySent.add(replyPayload.text);
+            recentlySent.add(combinedBody); // Prevent echo on the batch text itself
+            logVerbose(
+              `Added to echo detection set (size now: ${recentlySent.size}): ${replyPayload.text.substring(0, 50)}...`,
+            );
+            if (recentlySent.size > MAX_RECENT_MESSAGES) {
+              const firstKey = recentlySent.values().next().value;
+              if (firstKey) recentlySent.delete(firstKey);
+            }
           }
-        }
 
-        if (isVerbose()) {
-          console.log(
-            success(
-              `↩️  Auto-replied to ${from} (web${replyResult.mediaUrl || replyResult.mediaUrls?.length ? ", media" : ""}; batched ${messages.length})`,
-            ),
-          );
-        } else {
-          console.log(
-            success(
-              `↩️  ${replyResult.text ?? "<media>"}${replyResult.mediaUrl || replyResult.mediaUrls?.length ? " (media)" : ""}`,
+          const fromDisplay =
+            latest.chatType === "group"
+              ? conversationId
+              : (latest.from ?? "unknown");
+          if (isVerbose()) {
+            console.log(
+              success(
+                `↩️  Auto-replied to ${fromDisplay} (web${replyPayload.mediaUrl || replyPayload.mediaUrls?.length ? ", media" : ""}; batched ${messages.length})`,
+              ),
+            );
+          } else {
+            console.log(
+              success(
+                `↩️  ${replyPayload.text ?? "<media>"}${replyPayload.mediaUrl || replyPayload.mediaUrls?.length ? " (media)" : ""}`,
+              ),
+            );
+          }
+        } catch (err) {
+          console.error(
+            danger(
+              `Failed sending web auto-reply to ${latest.from ?? conversationId}: ${String(err)}`,
             ),
           );
         }
-      } catch (err) {
-        console.error(
-          danger(`Failed sending web auto-reply to ${from}: ${String(err)}`),
-        );
       }
     };
 
     const enqueueBatch = async (msg: WebInboundMsg) => {
-      const bucket = pendingBatches.get(msg.from) ?? { messages: [] };
+      const key = msg.conversationId ?? msg.from;
+      const bucket = pendingBatches.get(key) ?? { messages: [] };
       bucket.messages.push(msg);
-      pendingBatches.set(msg.from, bucket);
-
-      // Process immediately when queue is free; otherwise wait until it drains.
+      pendingBatches.set(key, bucket);
       if (getQueueSize() === 0) {
-        await processBatch(msg.from);
+        await processBatch(key);
       } else {
         bucket.timer =
-          bucket.timer ?? setTimeout(() => void processBatch(msg.from), 150);
+          bucket.timer ?? setTimeout(() => void processBatch(key), 150);
       }
     };
 
@@ -722,6 +927,7 @@ export async function monitorWebProvider(
         handledMessages += 1;
         lastMessageAt = Date.now();
         lastInboundMsg = msg;
+        const conversationId = msg.conversationId ?? msg.from;
 
         // Same-phone mode logging retained
         if (msg.from === msg.to) {
@@ -738,11 +944,41 @@ export async function monitorWebProvider(
           return;
         }
 
+        if (msg.chatType === "group") {
+          const history =
+            groupHistories.get(conversationId) ??
+            ([] as Array<{ sender: string; body: string; timestamp?: number }>);
+          history.push({
+            sender: msg.senderName ?? msg.senderE164 ?? "Unknown",
+            body: msg.body,
+            timestamp: msg.timestamp,
+          });
+          while (history.length > groupHistoryLimit) history.shift();
+          groupHistories.set(conversationId, history);
+
+          const mentionDebug = debugMention(msg, mentionConfig);
+          replyLogger.debug(
+            {
+              conversationId,
+              wasMentioned: mentionDebug.wasMentioned,
+              ...mentionDebug.details,
+            },
+            "group mention debug",
+          );
+          const wasMentioned = mentionDebug.wasMentioned;
+          if (mentionConfig.requireMention && !wasMentioned) {
+            logVerbose(
+              `Group message stored for context (no mention detected) in ${conversationId}: ${msg.body}`,
+            );
+            return;
+          }
+        }
+
         return enqueueBatch(msg);
       },
     });
 
-    // Start IPC server so `warelay send` can use this connection
+    // Start IPC server so `clawdis send` can use this connection
     // instead of creating a new one (which would corrupt Signal session)
     if ("sendMessage" in listener && "sendComposingTo" in listener) {
       startIpcServer(async (to, message, mediaUrl) => {
@@ -795,6 +1031,7 @@ export async function monitorWebProvider(
 
     if (keepAlive) {
       heartbeat = setInterval(() => {
+        if (!heartbeatsEnabled) return;
         const authAgeMs = getWebAuthAgeMs();
         const minutesSinceLastMessage = lastMessageAt
           ? Math.floor((Date.now() - lastMessageAt) / 60000)
@@ -850,6 +1087,7 @@ export async function monitorWebProvider(
     }
 
     const runReplyHeartbeat = async () => {
+      if (!heartbeatsEnabled) return;
       const queued = getQueueSize();
       if (queued > 0) {
         heartbeatLogger.info(
@@ -860,6 +1098,14 @@ export async function monitorWebProvider(
         return;
       }
       if (!replyHeartbeatMinutes) return;
+      if (lastInboundMsg?.chatType === "group") {
+        heartbeatLogger.info(
+          { connectionId, reason: "last-inbound-group" },
+          "reply heartbeat skipped",
+        );
+        console.log(success("heartbeat: skipped (group chat)"));
+        return;
+      }
       const tickStart = Date.now();
       if (!lastInboundMsg) {
         const fallbackTo = getFallbackRecipient(cfg);
@@ -931,31 +1177,31 @@ export async function monitorWebProvider(
             "reply heartbeat start",
           );
         }
-        const hbFrom = lastInboundMsg.from;
-        const hbTo = lastInboundMsg.to;
-        const hbComposing = lastInboundMsg.sendComposing;
-        const replyResult = await enqueueCommand(() =>
-          (replyResolver ?? getReplyFromConfig)(
-            {
-              Body: HEARTBEAT_PROMPT,
-              From: hbFrom,
-              To: hbTo,
-              MessageSid: snapshot.entry?.sessionId,
-              MediaPath: undefined,
-              MediaUrl: undefined,
-              MediaType: undefined,
-            },
-            {
-              onReplyStart: hbComposing,
-            },
-          ),
+        const replyResult = await (replyResolver ?? getReplyFromConfig)(
+          {
+            Body: HEARTBEAT_PROMPT,
+            From: lastInboundMsg.from,
+            To: lastInboundMsg.to,
+            MessageSid: snapshot.entry?.sessionId,
+            MediaPath: undefined,
+            MediaUrl: undefined,
+            MediaType: undefined,
+          },
+          {
+            onReplyStart: lastInboundMsg.sendComposing,
+            isHeartbeat: true,
+          },
         );
 
+        const replyPayload = Array.isArray(replyResult)
+          ? replyResult[0]
+          : replyResult;
+
         if (
-          !replyResult ||
-          (!replyResult.text &&
-            !replyResult.mediaUrl &&
-            !replyResult.mediaUrls?.length)
+          !replyPayload ||
+          (!replyPayload.text &&
+            !replyPayload.mediaUrl &&
+            !replyPayload.mediaUrls?.length)
         ) {
           heartbeatLogger.info(
             {
@@ -969,9 +1215,9 @@ export async function monitorWebProvider(
           return;
         }
 
-        const stripped = stripHeartbeatToken(replyResult.text);
+        const stripped = stripHeartbeatToken(replyPayload.text);
         const hasMedia = Boolean(
-          replyResult.mediaUrl || (replyResult.mediaUrls?.length ?? 0) > 0,
+          replyPayload.mediaUrl || (replyPayload.mediaUrls?.length ?? 0) > 0,
         );
         if (stripped.shouldSkip && !hasMedia) {
           heartbeatLogger.info(
@@ -979,7 +1225,7 @@ export async function monitorWebProvider(
               connectionId,
               durationMs: Date.now() - tickStart,
               reason: "heartbeat-token",
-              rawLength: replyResult.text?.length ?? 0,
+              rawLength: replyPayload.text?.length ?? 0,
             },
             "reply heartbeat skipped",
           );
@@ -999,7 +1245,7 @@ export async function monitorWebProvider(
         }
 
         const cleanedReply: ReplyPayload = {
-          ...replyResult,
+          ...replyPayload,
           text: finalText,
         };
 
@@ -1043,6 +1289,7 @@ export async function monitorWebProvider(
     if (replyHeartbeatMinutes && !replyHeartbeatTimer) {
       const intervalMs = replyHeartbeatMinutes * 60_000;
       replyHeartbeatTimer = setInterval(() => {
+        if (!heartbeatsEnabled) return;
         void runReplyHeartbeat();
       }, intervalMs);
       if (tuning.replyHeartbeatNow) {
@@ -1104,7 +1351,7 @@ export async function monitorWebProvider(
     if (loggedOut) {
       runtime.error(
         danger(
-          "WhatsApp session logged out. Run `warelay login --provider web` to relink.",
+          "WhatsApp session logged out. Run `clawdis login --provider web` to relink.",
         ),
       );
       await closeListener();

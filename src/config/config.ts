@@ -23,6 +23,7 @@ export type SessionConfig = {
   sessionIntro?: string;
   typingIntervalSeconds?: number;
   heartbeatMinutes?: number;
+  mainKey?: string;
 };
 
 export type LoggingConfig = {
@@ -43,11 +44,17 @@ export type WebConfig = {
   reconnect?: WebReconnectConfig;
 };
 
+export type GroupChatConfig = {
+  requireMention?: boolean;
+  mentionPatterns?: string[];
+  historyLimit?: number;
+};
+
 export type WarelayConfig = {
   logging?: LoggingConfig;
   inbound?: {
     allowFrom?: string[]; // E.164 numbers allowed to trigger auto-reply (without whatsapp:)
-    messagePrefix?: string; // Prefix added to all inbound messages (default: "[warelay]" if no allowFrom, else "")
+    messagePrefix?: string; // Prefix added to all inbound messages (default: "[clawdis]" if no allowFrom, else "")
     responsePrefix?: string; // Prefix auto-added to all outbound replies (e.g., "🦞")
     timestampPrefix?: boolean | string; // true/false or IANA timezone string (default: true with UTC)
     transcribeAudio?: {
@@ -55,10 +62,14 @@ export type WarelayConfig = {
       command: string[];
       timeoutSeconds?: number;
     };
+    groupChat?: GroupChatConfig;
     reply?: {
       mode: ReplyMode;
       text?: string;
       command?: string[];
+      heartbeatCommand?: string[];
+      thinkingDefault?: "off" | "minimal" | "low" | "medium" | "high";
+      verboseDefault?: "off" | "on";
       cwd?: string;
       template?: string;
       timeoutSeconds?: number;
@@ -72,19 +83,37 @@ export type WarelayConfig = {
         kind: AgentKind;
         format?: "text" | "json";
         identityPrefix?: string;
+        model?: string;
+        contextTokens?: number;
       };
     };
   };
   web?: WebConfig;
 };
 
-export const CONFIG_PATH = path.join(os.homedir(), ".warelay", "warelay.json");
+// New branding path (preferred)
+export const CONFIG_PATH_CLAWDIS = path.join(
+  os.homedir(),
+  ".clawdis",
+  "clawdis.json",
+);
 
 const ReplySchema = z
   .object({
     mode: z.union([z.literal("text"), z.literal("command")]),
     text: z.string().optional(),
     command: z.array(z.string()).optional(),
+    heartbeatCommand: z.array(z.string()).optional(),
+    thinkingDefault: z
+      .union([
+        z.literal("off"),
+        z.literal("minimal"),
+        z.literal("low"),
+        z.literal("medium"),
+        z.literal("high"),
+      ])
+      .optional(),
+    verboseDefault: z.union([z.literal("off"), z.literal("on")]).optional(),
     cwd: z.string().optional(),
     template: z.string().optional(),
     timeoutSeconds: z.number().int().positive().optional(),
@@ -107,27 +136,28 @@ const ReplySchema = z
         sendSystemOnce: z.boolean().optional(),
         sessionIntro: z.string().optional(),
         typingIntervalSeconds: z.number().int().positive().optional(),
+        mainKey: z.string().optional(),
       })
       .optional(),
     heartbeatMinutes: z.number().int().nonnegative().optional(),
     agent: z
       .object({
-        kind: z.union([
-          z.literal("claude"),
-          z.literal("opencode"),
-          z.literal("pi"),
-          z.literal("codex"),
-        ]),
+        kind: z.literal("pi"),
         format: z.union([z.literal("text"), z.literal("json")]).optional(),
         identityPrefix: z.string().optional(),
+        model: z.string().optional(),
+        contextTokens: z.number().int().positive().optional(),
       })
       .optional(),
   })
   .refine(
-    (val) => (val.mode === "text" ? Boolean(val.text) : Boolean(val.command)),
+    (val) =>
+      val.mode === "text"
+        ? Boolean(val.text)
+        : Boolean(val.command || val.heartbeatCommand),
     {
       message:
-        "reply.text is required for mode=text; reply.command is required for mode=command",
+        "reply.text is required for mode=text; reply.command or reply.heartbeatCommand is required for mode=command",
     },
   );
 
@@ -154,6 +184,13 @@ const WarelaySchema = z.object({
       messagePrefix: z.string().optional(),
       responsePrefix: z.string().optional(),
       timestampPrefix: z.union([z.boolean(), z.string()]).optional(),
+      groupChat: z
+        .object({
+          requireMention: z.boolean().optional(),
+          mentionPatterns: z.array(z.string()).optional(),
+          historyLimit: z.number().int().positive().optional(),
+        })
+        .optional(),
       transcribeAudio: z
         .object({
           command: z.array(z.string()),
@@ -180,15 +217,16 @@ const WarelaySchema = z.object({
 });
 
 export function loadConfig(): WarelayConfig {
-  // Read ~/.warelay/warelay.json (JSON5) if present.
+  // Read config file (JSON5) if present.
+  const configPath = CONFIG_PATH_CLAWDIS;
   try {
-    if (!fs.existsSync(CONFIG_PATH)) return {};
-    const raw = fs.readFileSync(CONFIG_PATH, "utf-8");
+    if (!fs.existsSync(configPath)) return {};
+    const raw = fs.readFileSync(configPath, "utf-8");
     const parsed = JSON5.parse(raw);
     if (typeof parsed !== "object" || parsed === null) return {};
     const validated = WarelaySchema.safeParse(parsed);
     if (!validated.success) {
-      console.error("Invalid warelay config:");
+      console.error("Invalid config:");
       for (const iss of validated.error.issues) {
         console.error(`- ${iss.path.join(".")}: ${iss.message}`);
       }
@@ -196,7 +234,7 @@ export function loadConfig(): WarelayConfig {
     }
     return validated.data as WarelayConfig;
   } catch (err) {
-    console.error(`Failed to read config at ${CONFIG_PATH}`, err);
+    console.error(`Failed to read config at ${configPath}`, err);
     return {};
   }
 }

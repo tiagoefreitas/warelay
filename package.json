@@ -1,27 +1,25 @@
 {
-  "name": "warelay",
-  "version": "1.3.0",
-  "description": "WhatsApp relay CLI (send, monitor, webhook, auto-reply) using Twilio",
+  "name": "clawdis",
+  "version": "2.0.0",
+  "description": "WhatsApp relay CLI (Baileys web) with Pi RPC agent",
   "type": "module",
   "main": "dist/index.js",
   "bin": {
-    "warelay": "bin/warelay.js",
-    "warely": "bin/warelay.js",
-    "wa": "bin/warelay.js"
+    "clawdis": "dist/index.js"
   },
   "scripts": {
     "dev": "tsx src/index.ts",
     "build": "tsc -p tsconfig.json",
     "start": "tsx src/index.ts",
-    "warelay": "tsx src/index.ts",
-    "warely": "tsx src/index.ts",
-    "wa": "tsx src/index.ts",
+    "clawdis": "tsx src/index.ts",
+    "clawdis:rpc": "tsx src/index.ts agent --mode rpc --json",
     "lint": "biome check src",
     "lint:fix": "biome check --write --unsafe src && biome format --write src",
     "format": "biome format src",
     "format:fix": "biome format src --write",
     "test": "vitest",
-    "test:coverage": "vitest run --coverage"
+    "test:coverage": "vitest run --coverage",
+    "webchat:bundle": "rolldown -c apps/macos/Sources/Clawdis/Resources/WebChat/rolldown.config.mjs"
   },
   "keywords": [],
   "author": "",
@@ -31,26 +29,31 @@
   },
   "packageManager": "pnpm@10.23.0",
   "dependencies": {
+    "@mariozechner/pi-ai": "^0.12.11",
+    "@mariozechner/pi-coding-agent": "^0.12.11",
     "@whiskeysockets/baileys": "7.0.0-rc.9",
     "body-parser": "^2.2.1",
     "chalk": "^5.6.2",
     "commander": "^14.0.2",
     "dotenv": "^17.2.3",
     "express": "^5.1.0",
+    "grammy": "^1.38.4",
     "json5": "^2.2.3",
     "pino": "^10.1.0",
     "qrcode-terminal": "^0.12.0",
     "sharp": "^0.33.5",
-    "twilio": "^5.10.6",
     "zod": "^4.1.13"
   },
   "devDependencies": {
     "@biomejs/biome": "^2.3.7",
+    "@mariozechner/mini-lit": "0.2.1",
     "@types/body-parser": "^1.19.6",
     "@types/express": "^5.0.5",
     "@types/node": "^24.10.1",
     "@types/qrcode-terminal": "^0.12.2",
     "@vitest/coverage-v8": "^4.0.13",
+    "lit": "^3.3.1",
+    "rolldown": "1.0.0-beta.53",
     "tsx": "^4.20.6",
     "typescript": "^5.9.3",
     "vitest": "^4.0.13"

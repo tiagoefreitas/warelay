@@ -2,13 +2,12 @@ import crypto from "node:crypto";
 import { createWriteStream } from "node:fs";
 import fs from "node:fs/promises";
 import { request } from "node:https";
-import os from "node:os";
 import path from "node:path";
 import { pipeline } from "node:stream/promises";
-
+import { CONFIG_DIR } from "../utils.js";
 import { detectMime, extensionForMime } from "./mime.js";
 
-const MEDIA_DIR = path.join(os.homedir(), ".warelay", "media");
+const MEDIA_DIR = path.join(CONFIG_DIR, "media");
 const MAX_BYTES = 5 * 1024 * 1024; // 5MB
 const DEFAULT_TTL_MS = 2 * 60 * 1000; // 2 minutes
 
@@ -48,9 +47,21 @@ async function downloadToFile(
   url: string,
   dest: string,
   headers?: Record<string, string>,
+  maxRedirects = 5,
 ): Promise<{ headerMime?: string; sniffBuffer: Buffer; size: number }> {
   return await new Promise((resolve, reject) => {
     const req = request(url, { headers }, (res) => {
+      // Follow redirects
+      if (res.statusCode && res.statusCode >= 300 && res.statusCode < 400) {
+        const location = res.headers.location;
+        if (!location || maxRedirects <= 0) {
+          reject(new Error(`Redirect loop or missing Location header`));
+          return;
+        }
+        const redirectUrl = new URL(location, url).href;
+        resolve(downloadToFile(redirectUrl, dest, headers, maxRedirects - 1));
+        return;
+      }
       if (!res.statusCode || res.statusCode >= 400) {
         reject(new Error(`HTTP ${res.statusCode ?? "?"} downloading media`));
         return;
@@ -107,9 +118,9 @@ export async function saveMediaSource(
   const dir = subdir ? path.join(MEDIA_DIR, subdir) : MEDIA_DIR;
   await fs.mkdir(dir, { recursive: true });
   await cleanOldMedia();
-  const id = crypto.randomUUID();
+  const baseId = crypto.randomUUID();
   if (looksLikeUrl(source)) {
-    const tempDest = path.join(dir, `${id}.tmp`);
+    const tempDest = path.join(dir, `${baseId}.tmp`);
     const { headerMime, sniffBuffer, size } = await downloadToFile(
       source,
       tempDest,
@@ -122,7 +133,8 @@ export async function saveMediaSource(
     });
     const ext =
       extensionForMime(mime) ?? path.extname(new URL(source).pathname);
-    const finalDest = path.join(dir, ext ? `${id}${ext}` : id);
+    const id = ext ? `${baseId}${ext}` : baseId;
+    const finalDest = path.join(dir, id);
     await fs.rename(tempDest, finalDest);
     return { id, path: finalDest, size, contentType: mime };
   }
@@ -137,7 +149,8 @@ export async function saveMediaSource(
   const buffer = await fs.readFile(source);
   const mime = detectMime({ buffer, filePath: source });
   const ext = extensionForMime(mime) ?? path.extname(source);
-  const dest = path.join(dir, ext ? `${id}${ext}` : id);
+  const id = ext ? `${baseId}${ext}` : baseId;
+  const dest = path.join(dir, id);
   await fs.writeFile(dest, buffer);
   return { id, path: dest, size: stat.size, contentType: mime };
 }
@@ -152,10 +165,11 @@ export async function saveMediaBuffer(
   }
   const dir = path.join(MEDIA_DIR, subdir);
   await fs.mkdir(dir, { recursive: true });
-  const id = crypto.randomUUID();
+  const baseId = crypto.randomUUID();
   const mime = detectMime({ buffer, headerMime: contentType });
   const ext = extensionForMime(mime);
-  const dest = path.join(dir, ext ? `${id}${ext}` : id);
+  const id = ext ? `${baseId}${ext}` : baseId;
+  const dest = path.join(dir, id);
   await fs.writeFile(dest, buffer);
   return { id, path: dest, size: buffer.byteLength, contentType: mime };
 }

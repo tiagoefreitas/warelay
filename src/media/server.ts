@@ -4,6 +4,7 @@ import path from "node:path";
 import express, { type Express } from "express";
 import { danger } from "../globals.js";
 import { defaultRuntime, type RuntimeEnv } from "../runtime.js";
+import { detectMime } from "./mime.js";
 import { cleanOldMedia, getMediaDir } from "./store.js";
 
 const DEFAULT_TTL_MS = 2 * 60 * 1000;
@@ -17,20 +18,34 @@ export function attachMediaRoutes(
 
   app.get("/media/:id", async (req, res) => {
     const id = req.params.id;
-    const file = path.join(mediaDir, id);
+    const mediaRoot = (await fs.realpath(mediaDir)) + path.sep;
+    const file = path.resolve(mediaRoot, id);
     try {
-      const stat = await fs.stat(file);
+      const lstat = await fs.lstat(file);
+      if (lstat.isSymbolicLink()) {
+        res.status(400).send("invalid path");
+        return;
+      }
+      const realPath = await fs.realpath(file);
+      if (!realPath.startsWith(mediaRoot)) {
+        res.status(400).send("invalid path");
+        return;
+      }
+      const stat = await fs.stat(realPath);
       if (Date.now() - stat.mtimeMs > ttlMs) {
-        await fs.rm(file).catch(() => {});
+        await fs.rm(realPath).catch(() => {});
         res.status(410).send("expired");
         return;
       }
-      res.sendFile(file);
+      const data = await fs.readFile(realPath);
+      const mime = detectMime({ buffer: data, filePath: realPath });
+      if (mime) res.type(mime);
+      res.send(data);
       // best-effort single-use cleanup after response ends
       res.on("finish", () => {
         setTimeout(() => {
-          fs.rm(file).catch(() => {});
-        }, 500);
+          fs.rm(realPath).catch(() => {});
+        }, 50);
       });
     } catch {
       res.status(404).send("not found");

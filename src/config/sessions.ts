@@ -12,9 +12,21 @@ export type SessionEntry = {
   sessionId: string;
   updatedAt: number;
   systemSent?: boolean;
+  abortedLastRun?: boolean;
+  thinkingLevel?: string;
+  verboseLevel?: string;
+  inputTokens?: number;
+  outputTokens?: number;
+  totalTokens?: number;
+  model?: string;
+  contextTokens?: number;
 };
 
-export const SESSION_STORE_DEFAULT = path.join(CONFIG_DIR, "sessions.json");
+export const SESSION_STORE_DEFAULT = path.join(
+  CONFIG_DIR,
+  "sessions",
+  "sessions.json",
+);
 export const DEFAULT_RESET_TRIGGER = "/new";
 export const DEFAULT_IDLE_MINUTES = 60;
 
@@ -56,5 +68,29 @@ export async function saveSessionStore(
 export function deriveSessionKey(scope: SessionScope, ctx: MsgContext) {
   if (scope === "global") return "global";
   const from = ctx.From ? normalizeE164(ctx.From) : "";
+  // Preserve group conversations as distinct buckets
+  if (typeof ctx.From === "string" && ctx.From.includes("@g.us")) {
+    return `group:${ctx.From}`;
+  }
+  if (typeof ctx.From === "string" && ctx.From.startsWith("group:")) {
+    return ctx.From;
+  }
   return from || "unknown";
+}
+
+/**
+ * Resolve the session key with an optional canonical direct-chat key (e.g., "main").
+ * All non-group direct chats collapse to `mainKey` when provided, keeping group isolation.
+ */
+export function resolveSessionKey(
+  scope: SessionScope,
+  ctx: MsgContext,
+  mainKey?: string,
+) {
+  const raw = deriveSessionKey(scope, ctx);
+  if (scope === "global") return raw;
+  const canonical = (mainKey ?? "").trim();
+  const isGroup = raw.startsWith("group:") || raw.includes("@g.us");
+  if (!isGroup && canonical) return canonical;
+  return raw;
 }
